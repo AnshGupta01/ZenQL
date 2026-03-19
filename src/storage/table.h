@@ -73,6 +73,10 @@ public:
         return (expires_at[row_index] > 0 && expires_at[row_index] < current_time);
     }
 
+    std::shared_mutex& get_rw_lock() {
+        return rw_lock;
+    }
+
     const std::vector<ColumnDef>& get_schema() const {
         return schema;
     }

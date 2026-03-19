@@ -12,6 +12,45 @@ ParsedQuery Parser::parse(const std::string& sql) {
 
     if (q.empty() || q.find("--") == 0) return result;
 
+    // Fast-path for common SELECT * FROM table WHERE ID = val
+    if (q.size() > 20 && (q.compare(0, 7, "SELECT ") == 0 || q.compare(0, 7, "select ") == 0)) {
+        size_t from_pos = q.find(" FROM ");
+        if (from_pos == std::string::npos) from_pos = q.find(" from ");
+        
+        if (from_pos != std::string::npos) {
+            size_t where_pos = q.find(" WHERE ");
+            if (where_pos == std::string::npos) where_pos = q.find(" where ");
+            
+            if (where_pos != std::string::npos) {
+                std::string table_name = q.substr(from_pos + 6, where_pos - (from_pos + 6));
+                table_name.erase(0, table_name.find_first_not_of(" "));
+                table_name.erase(table_name.find_last_not_of(" ") + 1);
+                
+                size_t eq_pos = q.find("=", where_pos);
+                if (eq_pos != std::string::npos) {
+                    std::string col_name = q.substr(where_pos + 7, eq_pos - (where_pos + 7));
+                    col_name.erase(0, col_name.find_first_not_of(" "));
+                    col_name.erase(col_name.find_last_not_of(" ") + 1);
+                    
+                    std::string val = q.substr(eq_pos + 1);
+                    val.erase(0, val.find_first_not_of(" '"));
+                    val.erase(val.find_last_not_of(" ';") + 1);
+                    
+                    SelectQuery sq;
+                    sq.table_name = table_name;
+                    sq.has_where = true;
+                    sq.where_column = col_name;
+                    sq.where_value = val;
+                    sq.columns.push_back("*");
+                    sq.is_join = false;
+                    result.type = QueryType::SELECT;
+                    result.query = sq;
+                    return result;
+                }
+            }
+        }
+    }
+
     std::string up_q = q;
     std::transform(up_q.begin(), up_q.end(), up_q.begin(), ::toupper);
 

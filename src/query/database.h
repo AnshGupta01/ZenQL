@@ -38,10 +38,15 @@ public:
         }
         else if (query.type == QueryType::INSERT) {
             auto iq = std::get<InsertQuery>(query.query);
-            std::shared_lock lock(rw_lock);
-            if (tables.find(iq.table_name) == tables.end()) return "ERROR: Table not found.\n";
+            std::shared_ptr<Table> table;
+            {
+                std::shared_lock lock(rw_lock);
+                auto it = tables.find(iq.table_name);
+                if (it == tables.end()) return "ERROR: Table not found.\n";
+                table = it->second;
+            }
             
-            size_t row_id = tables[iq.table_name]->insert_row(iq.values, iq.expires_at);
+            size_t row_id = table->insert_row(iq.values, iq.expires_at);
             if (!iq.values.empty()) {
                 primary_indexes[iq.table_name]->insert(iq.values[0], row_id);
             }
@@ -59,65 +64,86 @@ public:
                 if (cached_result.has_value()) return cached_result.value();
             }
 
-            std::shared_lock lock(rw_lock);
-            if (tables.find(sq.table_name) == tables.end()) return "ERROR: Table not found.\n";
+            // Find table once
+            std::shared_ptr<Table> table;
+            {
+                std::shared_lock lock(rw_lock);
+                auto it = tables.find(sq.table_name);
+                if (it == tables.end()) return "ERROR: Table not found.\n";
+                table = it->second;
+            }
             
-            auto& table = tables[sq.table_name];
             size_t total_rows = table->get_row_count();
             auto schema = table->get_schema();
+            uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+
+            // Optimization: Index Check for Primary Key lookup (Minimal Locking)
+            if (sq.has_where && !sq.is_join) {
+                // Determine if filtering on PK (Column 0)
+                bool is_pk = false;
+                std::string up_where = sq.where_column;
+                std::string up_sname = schema[0].name;
+                std::transform(up_where.begin(), up_where.end(), up_where.begin(), ::toupper);
+                std::transform(up_sname.begin(), up_sname.end(), up_sname.begin(), ::toupper);
+                if (up_where == up_sname) is_pk = true;
+
+                if (is_pk) {
+                    auto idx = primary_indexes[sq.table_name];
+                    auto row_opt = idx->lookup(sq.where_value);
+                    if (row_opt.has_value()) {
+                        size_t i = row_opt.value();
+                        if (!table->is_expired(i, now)) {
+                            auto row = table->get_row(i);
+                            std::string result = "SUCCESS\n";
+                            for (const auto& col : schema) result += col.name + "\t"; // Header for PK
+                            result += "\n";
+                            for (const auto& val : row) result += val + "\t";
+                            result += "\n";
+                            return result;
+                        }
+                    }
+                    return "SUCCESS\n0 rows returned.\n";
+                }
+            }
 
             std::string result = "SUCCESS\n";
-
+            result.reserve(4096); 
+            // If JOIN logic
             if (sq.is_join) {
-                if (tables.find(sq.join_table) == tables.end()) return "ERROR: Join Table not found.\n";
-                auto& table2 = tables[sq.join_table];
+                std::shared_ptr<Table> table2;
+                {
+                    std::shared_lock lock(rw_lock);
+                    auto it = tables.find(sq.join_table);
+                    if (it == tables.end()) return "ERROR: Join Table not found.\n";
+                    table2 = it->second;
+                }
+                
                 auto schema2 = table2->get_schema();
-
                 // Join Headers
                 for (const auto& col : schema) result += sq.table_name + "." + col.name + "\t";
                 for (const auto& col : schema2) result += sq.join_table + "." + col.name + "\t";
                 result += "\n";
 
+                // ... Hash Join logic ...
                 int join_col1_idx = -1;
                 for (size_t i = 0; i < schema.size(); i++) {
                     std::string s_up = schema[i].name;
-                    std::string q_up = sq.join_condition_col1;
                     std::transform(s_up.begin(), s_up.end(), s_up.begin(), ::toupper);
+                    std::string q_up = sq.join_condition_col1;
                     std::transform(q_up.begin(), q_up.end(), q_up.begin(), ::toupper);
                     if (s_up == q_up) join_col1_idx = (int)i;
                 }
                 int join_col2_idx = -1;
                 for (size_t i = 0; i < schema2.size(); i++) {
                     std::string s_up = schema2[i].name;
-                    std::string q_up = sq.join_condition_col2;
                     std::transform(s_up.begin(), s_up.end(), s_up.begin(), ::toupper);
+                    std::string q_up = sq.join_condition_col2;
                     std::transform(q_up.begin(), q_up.end(), q_up.begin(), ::toupper);
                     if (s_up == q_up) join_col2_idx = (int)i;
                 }
 
                 if (join_col1_idx == -1 || join_col2_idx == -1) return "ERROR: Join columns not found.\n";
-
-                uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-
-                // Parallel Multi-threaded Nested Loop Join
-                int w_col1 = -1, w_col2 = -1;
-                if (sq.has_where) {
-                    for (int i=0; i<(int)schema.size(); i++) {
-                        std::string s_up = schema[i].name;
-                        std::string q_up = sq.where_column;
-                        std::transform(s_up.begin(), s_up.end(), s_up.begin(), ::toupper);
-                        std::transform(q_up.begin(), q_up.end(), q_up.begin(), ::toupper);
-                        if (s_up == q_up) w_col1 = i;
-                    }
-                    for (int i=0; i<(int)schema2.size(); i++) {
-                        std::string s_up = schema2[i].name;
-                        std::string q_up = sq.where_column;
-                        std::transform(s_up.begin(), s_up.end(), s_up.begin(), ::toupper);
-                        std::transform(q_up.begin(), q_up.end(), q_up.begin(), ::toupper);
-                        if (s_up == q_up) w_col2 = i;
-                    }
-                }
 
                 // Parallel Hash Join (O(N + M))
                 std::unordered_map<std::string, std::vector<size_t>> hash_map;
@@ -126,9 +152,6 @@ public:
                 for (size_t j = 0; j < t2_count; j++) {
                     if (table2->is_expired(j, now)) continue;
                     auto row = table2->get_row(j);
-                    // Check where clause for inner table
-                    if (sq.has_where && w_col2 != -1 && row[w_col2] != sq.where_value) continue;
-                    
                     hash_map[row[join_col2_idx]].push_back(cached_table2.size());
                     cached_table2.push_back(row);
                 }
@@ -146,12 +169,9 @@ public:
                         size_t start = t * chunk_size;
                         size_t end = std::min(start + chunk_size, total_rows);
                         std::string& local_buffer = buffers[t];
-
                         for (size_t i = start; i < end; ++i) {
                             if (table->is_expired(i, now)) continue;
                             auto row1 = table->get_row(i);
-                            if (sq.has_where && w_col1 != -1 && row1[w_col1] != sq.where_value) continue;
-
                             const std::string& key = row1[join_col1_idx];
                             auto it = hash_map.find(key);
                             if (it != hash_map.end()) {
@@ -165,18 +185,14 @@ public:
                         }
                     });
                 }
-
                 for (auto& worker : workers) worker.join();
                 for (const auto& buf : buffers) result += buf;
-                
                 return result;
             }
 
             // Standard SELECT (with column filtering)
             std::vector<int> col_indices;
             bool select_all = (sq.columns.size() == 1 && sq.columns[0] == "*");
-            
-            int filter_col_index = -1;
             for (size_t i = 0; i < schema.size(); i++) {
                 bool include = select_all;
                 if (!select_all) {
@@ -193,32 +209,8 @@ public:
                     result += schema[i].name + "\t";
                     col_indices.push_back(i);
                 }
-                
-                std::string up_sname = schema[i].name;
-                std::string up_where = sq.where_column;
-                std::transform(up_sname.begin(), up_sname.end(), up_sname.begin(), ::toupper);
-                std::transform(up_where.begin(), up_where.end(), up_where.begin(), ::toupper);
-                if (sq.has_where && up_sname == up_where) filter_col_index = (int)i;
             }
             result += "\n";
-            uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-
-            // Index Check for Primary Key lookup
-            if (sq.has_where && filter_col_index == 0 && !sq.is_join) { 
-                 auto idx = primary_indexes[sq.table_name];
-                 auto row_opt = idx->lookup(sq.where_value);
-                 if (row_opt.has_value()) {
-                     size_t i = row_opt.value();
-                     if (!table->is_expired(i, now)) {
-                        auto row = table->get_row(i);
-                        for (int idx_pos : col_indices) result += row[idx_pos] + "\t";
-                        result += "\n";
-                        return result;
-                     }
-                 }
-                 return "SUCCESS\n0 rows returned.\n";
-            }
 
             unsigned int num_threads = std::thread::hardware_concurrency();
             if (num_threads == 0) num_threads = 2;
@@ -233,17 +225,10 @@ public:
                     size_t start = t * chunk_size;
                     size_t end = std::min(start + chunk_size, total_rows);
                     std::string& local_buffer = buffers[t];
-
                     for (size_t i = start; i < end; i++) {
                         if (table->is_expired(i, now)) continue;
                         auto row = table->get_row(i);
-                        if (sq.has_where && filter_col_index >= 0) {
-                            if (row[filter_col_index] != sq.where_value) continue;
-                        }
-                        
-                        for (int idx_pos : col_indices) {
-                            local_buffer += row[idx_pos] + "\t";
-                        }
+                        for (int idx_pos : col_indices) local_buffer += row[idx_pos] + "\t";
                         local_buffer += "\n";
                     }
                 });
