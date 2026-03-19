@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Iinclude -Wall -Wextra -O3 -pthread
+CXXFLAGS = -std=c++17 -Iinclude -Wall -Wextra -O3 -march=native -pthread -DNDEBUG -flto -funroll-loops
 
 # Directories
 SRC_DIR = src
@@ -9,7 +9,7 @@ BIN_DIR = bin
 
 # Source files
 CLIENT_LIB_SRCS = $(SRC_DIR)/client/libflexql.cpp
-SERVER_SRCS = $(SRC_DIR)/server/server.cpp $(SRC_DIR)/parser/parser.cpp
+SERVER_SRCS = $(SRC_DIR)/server/server.cpp $(SRC_DIR)/parser/parser.cpp $(SRC_DIR)/storage/checkpoint_manager.cpp $(SRC_DIR)/query/optimized_database.cpp
 REPL_SRCS = $(SRC_DIR)/client/main.cpp
 BENCHMARK_SRCS = benchmarks/benchmark.cpp
 QUERY_BENCHMARK_SRCS = benchmarks/query_benchmark.cpp
@@ -34,7 +34,7 @@ JOIN_BENCHMARK = $(BIN_DIR)/flexql_join_benchmark
 all: dirs $(LIBRARY) $(SERVER) $(REPL) $(BENCHMARK) $(QUERY_BENCHMARK) $(JOIN_BENCHMARK)
 
 dirs:
-	@mkdir -p $(BUILD_DIR)/client $(BUILD_DIR)/server $(BUILD_DIR)/benchmarks $(BIN_DIR)
+	@mkdir -p $(BUILD_DIR)/client $(BUILD_DIR)/server $(BUILD_DIR)/parser $(BUILD_DIR)/storage $(BUILD_DIR)/query $(BUILD_DIR)/benchmarks $(BIN_DIR)
 
 $(LIBRARY): $(CLIENT_LIB_OBJS)
 	ar rcs $@ $^
