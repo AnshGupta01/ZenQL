@@ -119,17 +119,18 @@ public:
         }
         expires_at.reserve(row_count + new_rows);
 
+        // Batch WAL logging - CRITICAL OPTIMIZATION
+        if (persistence_enabled && wal)
+        {
+            wal->log_insert_batch(name, rows_data, expiries);
+        }
+
+        // Insert all rows into memory
         size_t inserted = 0;
         for (size_t i = 0; i < rows_data.size(); ++i)
         {
             const auto &values = rows_data[i];
             uint64_t expiry = (i < expiries.size()) ? expiries[i] : 0;
-
-            // Log to WAL if persistence is enabled
-            if (persistence_enabled && wal)
-            {
-                wal->log_insert(name, values, expiry);
-            }
 
             for (size_t j = 0; j < columns.size() && j < values.size(); j++)
             {

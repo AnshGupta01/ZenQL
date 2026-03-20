@@ -16,12 +16,40 @@
 
 ThreadPool *global_pool = nullptr; // Moved ThreadPool to global scope
 
-OptimizedDatabase global_db("data", true);  // Enable persistence with "data" directory
+OptimizedDatabase global_db("data", true); // Enable persistence with "data" directory
+
+// Graceful shutdown flag
+std::atomic<bool> server_running{true};
+
+// Signal handler for graceful shutdown
+void signal_handler(int signal)
+{
+    if (signal == SIGINT || signal == SIGTERM)
+    {
+        std::cout << "\n[Server] Received shutdown signal, saving checkpoint..." << std::endl;
+        server_running.store(false, std::memory_order_release);
+
+        // Trigger explicit checkpoint before shutdown
+        global_db.save_checkpoint();
+        std::cout << "[Server] Checkpoint saved. Shutting down gracefully." << std::endl;
+
+        // Clean up thread pool
+        if (global_pool)
+        {
+            delete global_pool;
+            global_pool = nullptr;
+        }
+
+        exit(0);
+    }
+}
 
 void handle_client(int client_socket)
 {
     char buffer[BUFFER_SIZE];
-    std::string remainder = "";
+    std::string remainder;
+    remainder.reserve(4096); // Pre-allocate for typical query size
+
     while (true)
     {
         memset(buffer, 0, BUFFER_SIZE);
@@ -34,25 +62,57 @@ void handle_client(int client_socket)
             break;
         }
 
-        std::string raw_data = remainder + std::string(buffer, bytes_read);
-        remainder = "";
+        // Optimize: Append to remainder instead of creating new string
+        remainder.append(buffer, bytes_read);
 
-        std::string response = "";
+        std::string response;
+        response.reserve(8192); // Pre-allocate response buffer
+
         std::vector<std::string> queries;
+        queries.reserve(16); // Pre-allocate for typical batch
+
         size_t last_pos = 0;
         size_t next_pos = 0;
-        while ((next_pos = raw_data.find('\n', last_pos)) != std::string::npos)
-        {
-            std::string single_query = raw_data.substr(last_pos, next_pos - last_pos);
-            last_pos = next_pos + 1;
 
-            single_query.erase(single_query.find_last_not_of(" \r\t") + 1);
-            if (!single_query.empty())
-                queries.push_back(single_query);
+        // Parse queries in-place from combined buffer
+        while ((next_pos = remainder.find('\n', last_pos)) != std::string::npos)
+        {
+            if (next_pos > last_pos)
+            {
+                // Extract query view and trim
+                std::string_view query_view(&remainder[last_pos], next_pos - last_pos);
+
+                // Trim trailing whitespace
+                while (!query_view.empty() && (query_view.back() == ' ' ||
+                                               query_view.back() == '\r' || query_view.back() == '\t'))
+                {
+                    query_view.remove_suffix(1);
+                }
+
+                if (!query_view.empty())
+                {
+                    queries.emplace_back(query_view);
+                }
+            }
+            last_pos = next_pos + 1;
+        }
+
+        // Keep unparsed data for next iteration
+        if (last_pos < remainder.size())
+        {
+            if (last_pos > 0)
+            {
+                // Move unparsed data to front
+                remainder = remainder.substr(last_pos);
+            }
+        }
+        else
+        {
+            remainder.clear();
         }
 
         if (queries.empty())
-            continue; // Added check for empty queries
+            continue;
 
         if (queries.size() == 1)
         {
@@ -83,11 +143,6 @@ void handle_client(int client_socket)
                 response += r;
         }
 
-        if (last_pos < raw_data.length())
-        {
-            remainder = raw_data.substr(last_pos);
-        }
-
         if (!response.empty())
         {
             send(client_socket, response.c_str(), response.length(), 0);
@@ -97,7 +152,10 @@ void handle_client(int client_socket)
 
 int main()
 {
+    // Setup signal handlers for graceful shutdown
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
 
     // Initialize global pool early
     unsigned int n_threads = std::thread::hardware_concurrency();
@@ -140,8 +198,10 @@ int main()
     // ThreadPool pool(n_threads); // Removed local ThreadPool
 
     std::cout << "FlexQL Server listening on port " << PORT << "..." << std::endl;
+    std::cout << "[Persistence] Checkpoint-based persistence enabled (data dir: data/)" << std::endl;
+    std::cout << "[Shutdown] Press Ctrl+C to save and shutdown gracefully" << std::endl;
 
-    while (true)
+    while (server_running.load(std::memory_order_relaxed))
     {
         socklen_t addrlen = sizeof(address);
         int client_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen);
@@ -159,6 +219,17 @@ int main()
                              { handle_client(client_socket); });
     }
 
+    // Graceful shutdown cleanup
+    std::cout << "[Server] Shutting down, creating final checkpoint..." << std::endl;
+    global_db.save_checkpoint();
+
+    if (global_pool)
+    {
+        delete global_pool;
+        global_pool = nullptr;
+    }
+
     close(server_fd);
+    std::cout << "[Server] Shutdown complete." << std::endl;
     return 0;
 }

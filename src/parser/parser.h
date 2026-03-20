@@ -25,7 +25,7 @@ struct ColumnDef
 {
     std::string name;
     DataType type;
-    bool is_primary_key;
+    bool is_primary_key = false;
 
     // Helper method to convert DataType to string
     std::string get_type_string() const

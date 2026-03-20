@@ -61,26 +61,35 @@ public:
 };
 
 // Reader-Writer SpinLock for better read concurrency
+// Fixed: Readers no longer acquire write lock, allowing true concurrent reads
 class OptimizedRWSpinLock
 {
 private:
-    std::atomic<int> readers{0};
-    OptimizedSpinLock write_lock;
+    alignas(64) mutable std::atomic<int> readers{0};
+    alignas(64) mutable std::atomic<bool> write_lock_held{false};
+    mutable OptimizedSpinLock write_lock;
 
 public:
     void lock_shared() const
     {
-        while (true)
+        // Wait until no writer is active
+        while (write_lock_held.load(std::memory_order_acquire))
         {
-            while (write_lock.try_lock() == false)
-            {
-                std::this_thread::yield();
-            }
-
-            readers.fetch_add(1, std::memory_order_acquire);
-            write_lock.unlock();
-            break;
+            std::this_thread::yield();
         }
+
+        // Increment reader count
+        readers.fetch_add(1, std::memory_order_acquire);
+
+        // Double-check no writer started after we incremented
+        if (write_lock_held.load(std::memory_order_acquire))
+        {
+            // A writer started, back off and retry
+            readers.fetch_sub(1, std::memory_order_release);
+            lock_shared(); // Recursive retry
+            return;
+        }
+        // Successfully acquired shared lock
     }
 
     void unlock_shared() const
@@ -88,9 +97,11 @@ public:
         readers.fetch_sub(1, std::memory_order_release);
     }
 
-    void lock()
+    void lock() const
     {
         write_lock.lock();
+        write_lock_held.store(true, std::memory_order_release);
+
         // Wait for all readers to finish
         while (readers.load(std::memory_order_acquire) > 0)
         {
@@ -98,8 +109,9 @@ public:
         }
     }
 
-    void unlock()
+    void unlock() const
     {
+        write_lock_held.store(false, std::memory_order_release);
         write_lock.unlock();
     }
 };

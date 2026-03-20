@@ -5,8 +5,9 @@
 #include <memory>
 #include <chrono>
 #include <sstream>
+#include <cstring>
 #include "../storage/table.h"
-#include "../index/hash_index.h"
+#include "../index/fast_hash_index.h"
 #include "../index/btree_index.h"
 #include "../parser/parser.h"
 #include "../cache/lock_free_cache.h"
@@ -15,7 +16,7 @@
 class OptimizedDatabase
 {
     std::unordered_map<std::string, std::shared_ptr<Table>> tables;
-    std::unordered_map<std::string, std::shared_ptr<HashIndex>> primary_indexes;
+    std::unordered_map<std::string, std::shared_ptr<FastHashIndex>> primary_indexes;
     std::unordered_map<std::string, std::shared_ptr<BTreeIndex>> secondary_indexes;
     OptimizedLRUCache query_cache;
     std::shared_mutex rw_lock;
@@ -66,14 +67,55 @@ public:
 
     std::string execute(const std::string &sql)
     {
+        // Trim and validate input
+        std::string trimmed_sql = sql;
+        const size_t first_non_ws = trimmed_sql.find_first_not_of(" \n\r\t");
+        if (first_non_ws == std::string::npos)
+        {
+            return "ERROR: Empty query.\n";
+        }
+
+        trimmed_sql.erase(0, first_non_ws);
+        const size_t last_non_sep = trimmed_sql.find_last_not_of(" \n\r\t;");
+        if (last_non_sep == std::string::npos)
+        {
+            return "ERROR: Empty query.\n";
+        }
+        trimmed_sql.erase(last_non_sep + 1);
+
+        if (trimmed_sql.empty())
+        {
+            return "ERROR: Empty query.\n";
+        }
+
         ParsedQuery query = Parser::parse(sql);
 
         if (query.type == QueryType::CREATE_TABLE)
         {
             auto ct = std::get<CreateTableQuery>(query.query);
+
+            // Validate CREATE TABLE query
+            if (ct.table_name.empty())
+            {
+                return "ERROR: CREATE TABLE requires a table name.\nUsage: CREATE TABLE table_name (column1 type1, column2 type2, ...);\n";
+            }
+            if (ct.columns.empty())
+            {
+                return "ERROR: CREATE TABLE requires at least one column.\nUsage: CREATE TABLE table_name (column1 type1, column2 type2, ...);\n";
+            }
+
+            // Check if table already exists
+            {
+                std::shared_lock lock(rw_lock);
+                if (tables.find(ct.table_name) != tables.end())
+                {
+                    return "ERROR: Table '" + ct.table_name + "' already exists.\n";
+                }
+            }
+
             std::unique_lock lock(rw_lock);
             tables[ct.table_name] = std::make_shared<Table>(ct.table_name, ct.columns);
-            primary_indexes[ct.table_name] = std::make_shared<HashIndex>();
+            primary_indexes[ct.table_name] = std::make_shared<FastHashIndex>();
             return "SUCCESS: Table " + ct.table_name + " created successfully.\n";
         }
         else if (query.type == QueryType::CHECKPOINT)
@@ -90,13 +132,35 @@ public:
         else if (query.type == QueryType::INSERT)
         {
             auto iq = std::get<InsertQuery>(query.query);
+
+            // Validate INSERT query
+            if (iq.table_name.empty())
+            {
+                return "ERROR: INSERT requires a table name.\nUsage: INSERT INTO table_name VALUES (value1, value2, ...);\n";
+            }
+            if (iq.values.empty())
+            {
+                return "ERROR: INSERT requires at least one value.\nUsage: INSERT INTO table_name VALUES (value1, value2, ...);\n";
+            }
+
             std::shared_ptr<Table> table;
             {
                 std::shared_lock lock(rw_lock);
                 auto it = tables.find(iq.table_name);
                 if (it == tables.end())
-                    return "ERROR: Table not found.\n";
+                {
+                    return "ERROR: Table '" + iq.table_name + "' not found.\nUse CREATE TABLE to create it first.\n";
+                }
                 table = it->second;
+            }
+
+            // Validate column count matches
+            auto schema = table->get_schema();
+            if (iq.values.size() != schema.size())
+            {
+                return "ERROR: Column count mismatch. Expected " +
+                       std::to_string(schema.size()) + " values, got " +
+                       std::to_string(iq.values.size()) + ".\n";
             }
 
             size_t row_id = table->insert_row(iq.values, iq.expires_at);
@@ -111,6 +175,17 @@ public:
         else if (query.type == QueryType::SELECT)
         {
             auto sq = std::get<SelectQuery>(query.query);
+
+            // Validate SELECT query
+            if (sq.table_name.empty())
+            {
+                return "ERROR: SELECT requires a table name.\nUsage: SELECT * FROM table_name;\n";
+            }
+            if (sq.columns.empty())
+            {
+                return "ERROR: SELECT requires at least one column.\nUsage: SELECT * FROM table_name;\n";
+            }
+
             std::string cache_key = sq.table_name + "_all";
 
             // Enhanced caching for simple SELECT *
@@ -126,7 +201,9 @@ public:
                 std::shared_lock lock(rw_lock);
                 auto it = tables.find(sq.table_name);
                 if (it == tables.end())
-                    return "ERROR: Table not found.\n";
+                {
+                    return "ERROR: Table '" + sq.table_name + "' not found.\nUse CREATE TABLE to create it first.\n";
+                }
                 table = it->second;
             }
 
@@ -188,12 +265,24 @@ public:
             // JOIN optimization (keep existing logic but with better string management)
             if (sq.is_join)
             {
+                // Validate join query components
+                if (sq.join_table.empty())
+                {
+                    return "ERROR: JOIN requires a second table name.\nUsage: SELECT * FROM table1 INNER JOIN table2 ON table1.col = table2.col;\n";
+                }
+                if (sq.join_condition_col1.empty() || sq.join_condition_col2.empty())
+                {
+                    return "ERROR: JOIN requires ON condition with two columns.\nUsage: SELECT * FROM table1 INNER JOIN table2 ON table1.col = table2.col;\n";
+                }
+
                 std::shared_ptr<Table> table2;
                 {
                     std::shared_lock lock(rw_lock);
                     auto it = tables.find(sq.join_table);
                     if (it == tables.end())
-                        return "ERROR: Join Table not found.\n";
+                    {
+                        return "ERROR: Join table '" + sq.join_table + "' not found.\n";
+                    }
                     table2 = it->second;
                 }
 
@@ -309,6 +398,9 @@ public:
             // Standard SELECT with optimized string building
             std::vector<int> col_indices;
             bool select_all = (sq.columns.size() == 1 && sq.columns[0] == "*");
+
+            // Build header using buffer to avoid repeated concatenations
+            size_t header_size = 0;
             for (size_t i = 0; i < schema.size(); i++)
             {
                 bool include = select_all;
@@ -331,11 +423,19 @@ public:
                 }
                 if (include)
                 {
-                    result_buffer += schema[i].name + "\t";
+                    header_size += schema[i].name.size() + 1;
                     col_indices.push_back(i);
                 }
             }
-            result_buffer += "\n";
+
+            // Pre-allocate and build header efficiently
+            result_buffer.reserve(header_size + 1024);
+            for (int idx : col_indices)
+            {
+                result_buffer.append(schema[idx].name);
+                result_buffer.push_back('\t');
+            }
+            result_buffer.push_back('\n');
 
             // Adaptive parallel processing
             unsigned int num_threads = std::thread::hardware_concurrency();
@@ -358,16 +458,44 @@ public:
                     size_t end = std::min(start + chunk_size, total_rows);
                     std::string& local_buffer = buffers[t];
 
-                    // Better buffer pre-allocation
+                    // Optimized buffer pre-allocation based on estimated size
                     local_buffer.reserve((end - start) * col_indices.size() * 12);
+
+                    // Use thread-local char buffer for batching to eliminate O(n²) string concatenation
+                    thread_local std::vector<char> temp_buf(8192);
+                    size_t buf_pos = 0;
 
                     for (size_t i = start; i < end; i++) {
                         if (table->is_expired(i, now)) continue;
                         auto row = table->get_row(i);
+
                         for (int idx_pos : col_indices) {
-                            local_buffer += row[idx_pos] + "\t";
+                            const auto& val = row[idx_pos];
+                            size_t val_size = val.size();
+
+                            // Check if we need to flush temp buffer
+                            if (buf_pos + val_size + 2 > temp_buf.size()) {
+                                // Flush accumulated data to string
+                                local_buffer.append(temp_buf.data(), buf_pos);
+                                buf_pos = 0;
+
+                                // If single value is huge, resize buffer
+                                if (val_size + 2 > temp_buf.size()) {
+                                    temp_buf.resize(val_size + 1024);
+                                }
+                            }
+
+                            // Batch write to temp buffer
+                            std::memcpy(temp_buf.data() + buf_pos, val.data(), val_size);
+                            buf_pos += val_size;
+                            temp_buf[buf_pos++] = '\t';
                         }
-                        local_buffer += "\n";
+                        temp_buf[buf_pos++] = '\n';
+                    }
+
+                    // Final flush of remaining data
+                    if (buf_pos > 0) {
+                        local_buffer.append(temp_buf.data(), buf_pos);
                     } });
             }
 
@@ -459,7 +587,7 @@ public:
 
         // Create new table and index
         tables[table_name] = std::make_shared<Table>(table_name, schema);
-        primary_indexes[table_name] = std::make_shared<HashIndex>();
+        primary_indexes[table_name] = std::make_shared<FastHashIndex>();
         return true;
     }
 
