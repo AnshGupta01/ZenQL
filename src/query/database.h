@@ -73,7 +73,9 @@ public:
                 table = it->second;
             }
             
-            size_t total_rows = table->get_row_count();
+            // Lock the table ONCE for the entire scan; use _nolock variants inside loops
+            std::shared_lock table_lock(table->get_rw_lock());
+            size_t total_rows = table->get_row_count_nolock();
             auto schema = table->get_schema();
             uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
@@ -93,10 +95,10 @@ public:
                     auto row_opt = idx->lookup(sq.where_value);
                     if (row_opt.has_value()) {
                         size_t i = row_opt.value();
-                        if (!table->is_expired(i, now)) {
-                            auto row = table->get_row(i);
+                        if (!table->is_expired_nolock(i, now)) {
+                            auto row = table->get_row_nolock(i);
                             std::string result = "SUCCESS\n";
-                            for (const auto& col : schema) result += col.name + "\t"; // Header for PK
+                            for (const auto& col : schema) result += col.name + "\t";
                             result += "\n";
                             for (const auto& val : row) result += val + "\t";
                             result += "\n";
@@ -148,12 +150,17 @@ public:
                 // Parallel Hash Join (O(N + M))
                 std::unordered_map<std::string, std::vector<size_t>> hash_map;
                 std::vector<std::vector<std::string>> cached_table2;
-                size_t t2_count = table2->get_row_count();
-                for (size_t j = 0; j < t2_count; j++) {
-                    if (table2->is_expired(j, now)) continue;
-                    auto row = table2->get_row(j);
-                    hash_map[row[join_col2_idx]].push_back(cached_table2.size());
-                    cached_table2.push_back(row);
+                // Lock table2 once to build the hash map
+                {
+                    std::shared_lock t2_lock(table2->get_rw_lock());
+                    size_t t2_count = table2->get_row_count_nolock();
+                    cached_table2.reserve(t2_count);
+                    for (size_t j = 0; j < t2_count; j++) {
+                        if (table2->is_expired_nolock(j, now)) continue;
+                        auto row = table2->get_row_nolock(j);
+                        hash_map[row[join_col2_idx]].push_back(cached_table2.size());
+                        cached_table2.push_back(std::move(row));
+                    }
                 }
 
                 unsigned int num_threads = std::thread::hardware_concurrency();
@@ -170,8 +177,8 @@ public:
                         size_t end = std::min(start + chunk_size, total_rows);
                         std::string& local_buffer = buffers[t];
                         for (size_t i = start; i < end; ++i) {
-                            if (table->is_expired(i, now)) continue;
-                            auto row1 = table->get_row(i);
+                            if (table->is_expired_nolock(i, now)) continue;
+                            auto row1 = table->get_row_nolock(i);
                             const std::string& key = row1[join_col1_idx];
                             auto it = hash_map.find(key);
                             if (it != hash_map.end()) {
@@ -226,8 +233,8 @@ public:
                     size_t end = std::min(start + chunk_size, total_rows);
                     std::string& local_buffer = buffers[t];
                     for (size_t i = start; i < end; i++) {
-                        if (table->is_expired(i, now)) continue;
-                        auto row = table->get_row(i);
+                        if (table->is_expired_nolock(i, now)) continue;
+                        auto row = table->get_row_nolock(i);
                         for (int idx_pos : col_indices) local_buffer += row[idx_pos] + "\t";
                         local_buffer += "\n";
                     }

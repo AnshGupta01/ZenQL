@@ -145,7 +145,21 @@ void handle_client(int client_socket)
 
         if (!response.empty())
         {
-            send(client_socket, response.c_str(), response.length(), 0);
+            // Append sentinel so the client knows the full response has arrived.
+            // Using \x00END\x00 — a sequence that cannot appear in normal SQL output.
+            static const char SENTINEL[] = "\x00END\x00";
+            static const int  SENTINEL_LEN = 5;
+
+            // Stream in chunks to avoid a single blocking send for huge responses
+            const char* data = response.c_str();
+            size_t remaining = response.size();
+            while (remaining > 0) {
+                ssize_t sent = send(client_socket, data, remaining, MSG_NOSIGNAL);
+                if (sent <= 0) break;
+                data += sent;
+                remaining -= sent;
+            }
+            send(client_socket, SENTINEL, SENTINEL_LEN, MSG_NOSIGNAL);
         }
     }
 }

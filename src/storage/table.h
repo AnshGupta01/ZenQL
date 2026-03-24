@@ -69,11 +69,19 @@ public:
         return row_count++;
     }
 
+    // Thread-safe single-row access (acquires lock internally)
     std::vector<std::string> get_row(size_t row_index)
     {
         std::shared_lock lock(rw_lock);
+        return get_row_nolock(row_index);
+    }
+
+    // Lock-free variant — caller MUST hold at least a shared_lock on get_rw_lock()
+    std::vector<std::string> get_row_nolock(size_t row_index) const
+    {
         std::vector<std::string> row;
-        for (auto &col : columns)
+        row.reserve(columns.size());
+        for (const auto &col : columns)
         {
             row.push_back(col->get(row_index));
         }
@@ -86,9 +94,18 @@ public:
         return row_count;
     }
 
+    // Lock-free row count — caller MUST hold at least a shared_lock on get_rw_lock()
+    size_t get_row_count_nolock() const { return row_count; }
+
     bool is_expired(size_t row_index, uint64_t current_time)
     {
         std::shared_lock lock(rw_lock);
+        return is_expired_nolock(row_index, current_time);
+    }
+
+    // Lock-free variant — caller MUST hold at least a shared_lock on get_rw_lock()
+    bool is_expired_nolock(size_t row_index, uint64_t current_time) const
+    {
         if (row_index >= expires_at.size())
             return false;
         return (expires_at[row_index] > 0 && expires_at[row_index] < current_time);

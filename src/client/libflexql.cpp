@@ -70,32 +70,28 @@ int flexql_exec(
     std::string sql_with_nl = std::string(sql) + "\n";
     send(db->socket_fd, sql_with_nl.c_str(), sql_with_nl.length(), 0);
 
-    // Fixed: Support chunked reads for large result sets
+    // Read until the server's sentinel \x00END\x00 is received
     std::string response;
-    response.reserve(1024 * 1024); // Start with 1MB buffer
+    response.reserve(4 * 1024 * 1024); // 4MB initial reserve
     char buffer[65536];
-    bool complete = false;
+    static const std::string SENTINEL("\x00END\x00", 5);
 
-    while (!complete)
+    while (true)
     {
-        int valread = read(db->socket_fd, buffer, sizeof(buffer) - 1);
+        int valread = read(db->socket_fd, buffer, sizeof(buffer));
         if (valread <= 0)
-        {
-            if (response.empty())
-                return FLEXQL_ERROR;
-            break; // Got some data, might be complete
-        }
+            break; // Connection closed or error
 
-        buffer[valread] = '\0';
         response.append(buffer, valread);
 
-        // Check if response is complete (ends with newline or success/error marker)
-        if (valread < sizeof(buffer) - 1 || // Partial read, likely end
-            response.find("\n0 rows") != std::string::npos ||
-            response.find("SUCCESS\n") == 0 ||
-            response.find("ERROR") == 0)
+        // Check if the sentinel has arrived (it's always at the very end)
+        if (response.size() >= SENTINEL.size() &&
+            response.compare(response.size() - SENTINEL.size(),
+                             SENTINEL.size(), SENTINEL) == 0)
         {
-            complete = true;
+            // Strip the sentinel before parsing
+            response.resize(response.size() - SENTINEL.size());
+            break;
         }
     }
 
