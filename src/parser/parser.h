@@ -11,7 +11,6 @@ enum class QueryType
     SELECT,
     CHECKPOINT,
     DELETE,
-    UPDATE,
     UNKNOWN
 };
 
@@ -22,7 +21,14 @@ enum class DataType
     VARCHAR,
     DATETIME
 };
-enum class CompareOp { EQ, GT, LT, GTE, LTE, NEQ };
+enum class CompareOp
+{
+    EQ,
+    GT,
+    LT,
+    GTE,
+    LTE
+};
 
 struct ColumnDef
 {
@@ -97,6 +103,7 @@ struct SelectQuery
     std::string join_table;
     std::string join_condition_col1; // tableA.col
     std::string join_condition_col2; // tableB.col
+    CompareOp join_op = CompareOp::EQ;
 
     // ORDER BY Support
     bool has_order_by = false;
@@ -118,15 +125,10 @@ struct DeleteQuery
     CompareOp where_op = CompareOp::EQ;
 };
 
-struct UpdateQuery
-{
-    std::string table_name;
-};
-
 struct ParsedQuery
 {
     QueryType type;
-    std::variant<CreateTableQuery, InsertQuery, SelectQuery, CheckpointQuery, DeleteQuery, UpdateQuery> query;
+    std::variant<CreateTableQuery, InsertQuery, SelectQuery, CheckpointQuery, DeleteQuery> query;
 };
 
 class Parser

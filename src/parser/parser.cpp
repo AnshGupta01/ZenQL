@@ -194,7 +194,7 @@ namespace
             return false;
 
         q = trim(q.substr(5));
-        
+
         bool if_not_exists = false;
         if (starts_with_keyword(q, "IF"))
         {
@@ -411,12 +411,31 @@ namespace
         size_t op_len = 0;
         CompareOp op = CompareOp::EQ;
 
-        if ((op_pos = where_text.find(">=")) != std::string::npos) { op_len = 2; op = CompareOp::GTE; }
-        else if ((op_pos = where_text.find("<=")) != std::string::npos) { op_len = 2; op = CompareOp::LTE; }
-        else if ((op_pos = where_text.find("!=")) != std::string::npos) { op_len = 2; op = CompareOp::NEQ; }
-        else if ((op_pos = where_text.find(">")) != std::string::npos) { op_len = 1; op = CompareOp::GT; }
-        else if ((op_pos = where_text.find("<")) != std::string::npos) { op_len = 1; op = CompareOp::LT; }
-        else if ((op_pos = where_text.find("=")) != std::string::npos) { op_len = 1; op = CompareOp::EQ; }
+        if ((op_pos = where_text.find(">=")) != std::string::npos)
+        {
+            op_len = 2;
+            op = CompareOp::GTE;
+        }
+        else if ((op_pos = where_text.find("<=")) != std::string::npos)
+        {
+            op_len = 2;
+            op = CompareOp::LTE;
+        }
+        else if ((op_pos = where_text.find(">")) != std::string::npos)
+        {
+            op_len = 1;
+            op = CompareOp::GT;
+        }
+        else if ((op_pos = where_text.find("<")) != std::string::npos)
+        {
+            op_len = 1;
+            op = CompareOp::LT;
+        }
+        else if ((op_pos = where_text.find("=")) != std::string::npos)
+        {
+            op_len = 1;
+            op = CompareOp::EQ;
+        }
 
         if (op_pos == std::string::npos)
             return false;
@@ -537,17 +556,55 @@ namespace
 
             std::string_view on_rest = trim(join_rest.substr(on_pos + 2));
             const size_t where_after_on = ifind_keyword(on_rest, "WHERE");
+            const size_t order_after_on = ifind_keyword(on_rest, "ORDER BY");
 
-            std::string_view join_cond = where_after_on == std::string::npos
-                                             ? on_rest
-                                             : trim(on_rest.substr(0, where_after_on));
+            std::string_view join_cond;
+            if (where_after_on != std::string::npos)
+            {
+                join_cond = trim(on_rest.substr(0, where_after_on));
+            }
+            else if (order_after_on != std::string::npos)
+            {
+                join_cond = trim(on_rest.substr(0, order_after_on));
+            }
+            else
+            {
+                join_cond = on_rest;
+            }
 
-            const size_t eq_pos = join_cond.find('=');
-            if (eq_pos == std::string::npos)
+            size_t op_pos = std::string::npos;
+            size_t op_len = 0;
+            CompareOp join_op = CompareOp::EQ;
+            if ((op_pos = join_cond.find(">=")) != std::string::npos)
+            {
+                op_len = 2;
+                join_op = CompareOp::GTE;
+            }
+            else if ((op_pos = join_cond.find("<=")) != std::string::npos)
+            {
+                op_len = 2;
+                join_op = CompareOp::LTE;
+            }
+            else if ((op_pos = join_cond.find(">")) != std::string::npos)
+            {
+                op_len = 1;
+                join_op = CompareOp::GT;
+            }
+            else if ((op_pos = join_cond.find("<")) != std::string::npos)
+            {
+                op_len = 1;
+                join_op = CompareOp::LT;
+            }
+            else if ((op_pos = join_cond.find("=")) != std::string::npos)
+            {
+                op_len = 1;
+                join_op = CompareOp::EQ;
+            }
+            if (op_pos == std::string::npos)
                 return false;
 
-            std::string_view lhs = trim(join_cond.substr(0, eq_pos));
-            std::string_view rhs = trim(join_cond.substr(eq_pos + 1));
+            std::string_view lhs = trim(join_cond.substr(0, op_pos));
+            std::string_view rhs = trim(join_cond.substr(op_pos + op_len));
 
             const size_t lhs_dot = lhs.find('.');
             const size_t rhs_dot = rhs.find('.');
@@ -556,21 +613,55 @@ namespace
 
             sq.join_condition_col1 = std::string(trim(lhs.substr(lhs_dot + 1)));
             sq.join_condition_col2 = std::string(trim(rhs.substr(rhs_dot + 1)));
+            sq.join_op = join_op;
 
             if (where_after_on != std::string::npos)
             {
                 std::string_view where_text = trim(on_rest.substr(where_after_on + 5));
                 const size_t order_pos = ifind_keyword(where_text, "ORDER BY");
-                if (order_pos != std::string::npos) {
+                if (order_pos != std::string::npos)
+                {
                     std::string_view actual_where = trim(where_text.substr(0, order_pos));
-                    if (!actual_where.empty() && !parse_where_clause(actual_where, sq)) return false;
+                    if (!actual_where.empty() && !parse_where_clause(actual_where, sq))
+                        return false;
                     std::string_view order_text = trim(where_text.substr(order_pos + 8));
                     std::stringstream ss((std::string(order_text)));
-                    std::string col; if (ss >> col) { sq.has_order_by = true; sq.order_by_column = col;
-                        std::string dir; if (ss >> dir) { std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper); if (dir == "DESC") sq.order_desc = true; }
+                    std::string col;
+                    if (ss >> col)
+                    {
+                        sq.has_order_by = true;
+                        sq.order_by_column = col;
+                        std::string dir;
+                        if (ss >> dir)
+                        {
+                            std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper);
+                            if (dir == "DESC")
+                                sq.order_desc = true;
+                        }
                     }
-                } else {
-                    if (!parse_where_clause(where_text, sq)) return false;
+                }
+                else
+                {
+                    if (!parse_where_clause(where_text, sq))
+                        return false;
+                }
+            }
+            else if (order_after_on != std::string::npos)
+            {
+                std::string_view order_text = trim(on_rest.substr(order_after_on + 8));
+                std::stringstream ss((std::string(order_text)));
+                std::string col;
+                if (ss >> col)
+                {
+                    sq.has_order_by = true;
+                    sq.order_by_column = col;
+                    std::string dir;
+                    if (ss >> dir)
+                    {
+                        std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper);
+                        if (dir == "DESC")
+                            sq.order_desc = true;
+                    }
                 }
             }
         }
@@ -580,11 +671,15 @@ namespace
             const size_t local_order_pos = ifind_keyword(after_from, "ORDER BY");
 
             std::string_view table_name_view;
-            if (local_where_pos != std::string::npos) table_name_view = trim(after_from.substr(0, local_where_pos));
-            else if (local_order_pos != std::string::npos) table_name_view = trim(after_from.substr(0, local_order_pos));
-            else table_name_view = trim(after_from);
+            if (local_where_pos != std::string::npos)
+                table_name_view = trim(after_from.substr(0, local_where_pos));
+            else if (local_order_pos != std::string::npos)
+                table_name_view = trim(after_from.substr(0, local_order_pos));
+            else
+                table_name_view = trim(after_from);
 
-            if (!is_valid_identifier(table_name_view)) return false;
+            if (!is_valid_identifier(table_name_view))
+                return false;
             sq.table_name = std::string(table_name_view);
 
             if (local_where_pos != std::string::npos)
@@ -594,29 +689,52 @@ namespace
                 if (order_pos != std::string::npos)
                 {
                     std::string_view actual_where = trim(where_text.substr(0, order_pos));
-                    if (!actual_where.empty() && !parse_where_clause(actual_where, sq)) return false;
+                    if (!actual_where.empty() && !parse_where_clause(actual_where, sq))
+                        return false;
                     std::string_view order_text = trim(where_text.substr(order_pos + 8));
                     std::stringstream ss((std::string(order_text)));
-                    std::string col; if (ss >> col) { sq.has_order_by = true; sq.order_by_column = col;
-                        std::string dir; if (ss >> dir) { std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper); if (dir == "DESC") sq.order_desc = true; }
+                    std::string col;
+                    if (ss >> col)
+                    {
+                        sq.has_order_by = true;
+                        sq.order_by_column = col;
+                        std::string dir;
+                        if (ss >> dir)
+                        {
+                            std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper);
+                            if (dir == "DESC")
+                                sq.order_desc = true;
+                        }
                     }
                 }
                 else
                 {
-                    if (!parse_where_clause(where_text, sq)) return false;
+                    if (!parse_where_clause(where_text, sq))
+                        return false;
                 }
             }
             else if (local_order_pos != std::string::npos)
             {
                 std::string_view order_text = trim(after_from.substr(local_order_pos + 8));
                 std::stringstream ss((std::string(order_text)));
-                std::string col; if (ss >> col) { sq.has_order_by = true; sq.order_by_column = col;
-                    std::string dir; if (ss >> dir) { std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper); if (dir == "DESC") sq.order_desc = true; }
+                std::string col;
+                if (ss >> col)
+                {
+                    sq.has_order_by = true;
+                    sq.order_by_column = col;
+                    std::string dir;
+                    if (ss >> dir)
+                    {
+                        std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper);
+                        if (dir == "DESC")
+                            sq.order_desc = true;
+                    }
                 }
             }
         }
 
-        if (sq.table_name.empty() || sq.columns.empty()) return false;
+        if (sq.table_name.empty() || sq.columns.empty())
+            return false;
         result.type = QueryType::SELECT;
         result.query = std::move(sq);
         return true;
@@ -624,25 +742,32 @@ namespace
 
     bool parse_delete(std::string_view q, ParsedQuery &result)
     {
-        if (!starts_with_keyword(q, "DELETE")) return false;
+        if (!starts_with_keyword(q, "DELETE"))
+            return false;
         q = trim(q.substr(6));
-        if (!starts_with_keyword(q, "FROM")) return false;
+        if (!starts_with_keyword(q, "FROM"))
+            return false;
         q = trim(q.substr(4));
 
         const size_t where_pos = ifind_keyword(q, "WHERE");
         std::string_view table_view = (where_pos == std::string::npos) ? q : trim(q.substr(0, where_pos));
-        if (!is_valid_identifier(table_view)) return false;
+        if (!is_valid_identifier(table_view))
+            return false;
 
         DeleteQuery dq;
         dq.table_name = std::string(table_view);
-        if (where_pos != std::string::npos) {
+        if (where_pos != std::string::npos)
+        {
             SelectQuery dummy;
-            if (parse_where_clause(trim(q.substr(where_pos + 5)), dummy)) {
+            if (parse_where_clause(trim(q.substr(where_pos + 5)), dummy))
+            {
                 dq.has_where = true;
                 dq.where_column = dummy.where_column;
                 dq.where_value = dummy.where_value;
                 dq.where_op = dummy.where_op;
-            } else return false;
+            }
+            else
+                return false;
         }
         result.type = QueryType::DELETE;
         result.query = std::move(dq);
@@ -657,20 +782,43 @@ ParsedQuery Parser::parse(const std::string &sql)
     result.query = CheckpointQuery{};
 
     std::string_view q = trim(sql);
-    if (!q.empty() && q.back() == ';') { q.remove_suffix(1); q = trim(q); }
-    if (q.empty()) return result;
-    if (q.size() >= 2 && q[0] == '-' && q[1] == '-') return result;
+    if (!q.empty() && q.back() == ';')
+    {
+        q.remove_suffix(1);
+        q = trim(q);
+    }
+    if (q.empty())
+        return result;
+    if (q.size() >= 2 && q[0] == '-' && q[1] == '-')
+        return result;
 
-    if (starts_with_keyword(q, "CHECKPOINT")) {
+    if (starts_with_keyword(q, "CHECKPOINT"))
+    {
         result.type = QueryType::CHECKPOINT;
         result.query = CheckpointQuery{};
         return result;
     }
 
-    if (starts_with_keyword(q, "CREATE")) { if (parse_create_table(q, result)) return result; }
-    else if (starts_with_keyword(q, "INSERT")) { if (parse_insert(q, result)) return result; }
-    else if (starts_with_keyword(q, "SELECT")) { if (parse_select(q, result)) return result; }
-    else if (starts_with_keyword(q, "DELETE")) { if (parse_delete(q, result)) return result; }
+    if (starts_with_keyword(q, "CREATE"))
+    {
+        if (parse_create_table(q, result))
+            return result;
+    }
+    else if (starts_with_keyword(q, "INSERT"))
+    {
+        if (parse_insert(q, result))
+            return result;
+    }
+    else if (starts_with_keyword(q, "SELECT"))
+    {
+        if (parse_select(q, result))
+            return result;
+    }
+    else if (starts_with_keyword(q, "DELETE"))
+    {
+        if (parse_delete(q, result))
+            return result;
+    }
 
     return result;
 }
