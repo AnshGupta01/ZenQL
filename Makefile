@@ -24,8 +24,9 @@ LIBRARY = $(BIN_DIR)/libflexql.a
 SERVER = $(BIN_DIR)/flexql_server
 REPL = $(BIN_DIR)/flexql_repl
 MASTER_BENCHMARK = $(BIN_DIR)/flexql_master_benchmark
+FLEXQL_BENCHMARK = $(BIN_DIR)/benchmark_flexql
 
-all: dirs $(LIBRARY) $(SERVER) $(REPL) $(MASTER_BENCHMARK)
+all: dirs $(LIBRARY) $(SERVER) $(REPL) $(MASTER_BENCHMARK) $(FLEXQL_BENCHMARK)
 
 dirs:
 	@mkdir -p $(BUILD_DIR)/client $(BUILD_DIR)/server $(BUILD_DIR)/parser $(BUILD_DIR)/storage $(BUILD_DIR)/query $(BUILD_DIR)/benchmarks $(BIN_DIR)
@@ -41,6 +42,9 @@ $(REPL): $(REPL_OBJS) $(LIBRARY)
 
 $(MASTER_BENCHMARK): $(MASTER_BENCHMARK_OBJS) $(LIBRARY)
 	$(CXX) $(CXXFLAGS) $(MASTER_BENCHMARK_OBJS) -L$(BIN_DIR) -lflexql -o $@
+
+$(FLEXQL_BENCHMARK): $(BUILD_DIR)/benchmarks/benchmark_flexql.o $(LIBRARY)
+	$(CXX) $(CXXFLAGS) $< -L$(BIN_DIR) -lflexql -o $@
 
 run-benchmark: $(MASTER_BENCHMARK) $(SERVER)
 	@pkill flexql_server || true

@@ -10,6 +10,8 @@ enum class QueryType
     INSERT,
     SELECT,
     CHECKPOINT,
+    DELETE,
+    UPDATE,
     UNKNOWN
 };
 
@@ -20,6 +22,7 @@ enum class DataType
     VARCHAR,
     DATETIME
 };
+enum class CompareOp { EQ, GT, LT, GTE, LTE, NEQ };
 
 struct ColumnDef
 {
@@ -68,13 +71,14 @@ struct CreateTableQuery
 {
     std::string table_name;
     std::vector<ColumnDef> columns;
+    bool if_not_exists = false;
 };
 
 struct InsertQuery
 {
     std::string table_name;
-    std::vector<std::string> values;
-    uint64_t expires_at; // Handled per-row
+    std::vector<std::vector<std::string>> rows;
+    uint64_t expires_at;
 };
 
 struct SelectQuery
@@ -86,23 +90,43 @@ struct SelectQuery
     bool has_where;
     std::string where_column;
     std::string where_value;
+    CompareOp where_op = CompareOp::EQ;
 
     // JOIN Support
     bool is_join;
     std::string join_table;
     std::string join_condition_col1; // tableA.col
     std::string join_condition_col2; // tableB.col
+
+    // ORDER BY Support
+    bool has_order_by = false;
+    std::string order_by_column;
+    bool order_desc = false;
 };
 
 struct CheckpointQuery
 {
-    // Empty struct - checkpoint takes no parameters
+    // Empty struct
+};
+
+struct DeleteQuery
+{
+    std::string table_name;
+    bool has_where = false;
+    std::string where_column;
+    std::string where_value;
+    CompareOp where_op = CompareOp::EQ;
+};
+
+struct UpdateQuery
+{
+    std::string table_name;
 };
 
 struct ParsedQuery
 {
     QueryType type;
-    std::variant<CreateTableQuery, InsertQuery, SelectQuery, CheckpointQuery> query;
+    std::variant<CreateTableQuery, InsertQuery, SelectQuery, CheckpointQuery, DeleteQuery, UpdateQuery> query;
 };
 
 class Parser

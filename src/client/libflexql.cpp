@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cstdio>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <string>
@@ -48,6 +49,9 @@ int flexql_open(const char *host, int port, FlexQL **db)
         free(*db);
         return FLEXQL_ERROR;
     }
+
+    int nodelay = 1;
+    setsockopt((*db)->socket_fd, IPPROTO_TCP, TCP_NODELAY, (void *)&nodelay, sizeof(nodelay));
 
     (*db)->is_connected = true;
     return FLEXQL_OK;
@@ -95,6 +99,7 @@ int flexql_exec(
         }
     }
 
+
     std::stringstream ss(response);
     std::string line;
     bool header_read = false;
@@ -105,17 +110,17 @@ int flexql_exec(
     {
         if (line.empty())
             continue;
-        if (line.find("OK") == 0 || line.find("SUCCESS") == 0)
-        {
-            if (line.find("rows returned") != std::string::npos)
-                break;
-            continue;
-        }
         if (line.find("ERROR") == 0)
         {
             if (errmsg)
                 *errmsg = strdup(line.c_str());
             return FLEXQL_ERROR;
+        }
+        if (line.find("OK") == 0 || line.find("SUCCESS") == 0)
+        {
+            if (line.find("rows returned") != std::string::npos)
+                break;
+            continue;
         }
 
         if (!header_read)
@@ -150,11 +155,8 @@ int flexql_exec(
         for (auto &s : rowValues)
             rowValuesPtrs.push_back((char *)s.c_str());
 
-        if (callback)
-        {
-            if (callback(arg, colNames.size(), rowValuesPtrs.data(), colNamesPtrs.data()) != 0)
-                break;
-        }
+        if (callback && callback(arg, colNames.size(), rowValuesPtrs.data(), colNamesPtrs.data()) != 0)
+            break;
     }
 
     return FLEXQL_OK;

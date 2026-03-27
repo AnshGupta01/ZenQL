@@ -52,12 +52,16 @@ void handle_client(int client_socket)
 
     while (true)
     {
-        memset(buffer, 0, BUFFER_SIZE);
-        int bytes_read = read(client_socket, buffer, BUFFER_SIZE - 1);
+        int bytes_read = recv(client_socket, buffer, BUFFER_SIZE, 0);
 
         if (bytes_read <= 0)
         {
-            std::cout << "Client disconnected." << std::endl;
+            if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+            if (bytes_read < 0) {
+                std::cerr << "Socket receive error (errno: " << errno << ")" << std::endl;
+            } else { // bytes_read == 0
+                std::cout << "Client disconnected." << std::endl;
+            }
             close(client_socket);
             break;
         }
@@ -68,8 +72,8 @@ void handle_client(int client_socket)
         std::string response;
         response.reserve(8192); // Pre-allocate response buffer
 
-        std::vector<std::string> queries;
-        queries.reserve(16); // Pre-allocate for typical batch
+        std::vector<std::string_view> queries;
+        queries.reserve(64);
 
         size_t last_pos = 0;
         size_t next_pos = 0;
@@ -79,9 +83,7 @@ void handle_client(int client_socket)
         {
             if (next_pos > last_pos)
             {
-                // Extract query view and trim
                 std::string_view query_view(&remainder[last_pos], next_pos - last_pos);
-
                 // Trim trailing whitespace
                 while (!query_view.empty() && (query_view.back() == ' ' ||
                                                query_view.back() == '\r' || query_view.back() == '\t'))
@@ -97,50 +99,24 @@ void handle_client(int client_socket)
             last_pos = next_pos + 1;
         }
 
+        // Process collected queries BEFORE modifying remainder (to keep query views valid)
+        if (!queries.empty())
+        {
+            uint64_t now = global_db.get_current_time();
+            response.reserve(queries.size() * 64);
+            for (const auto& q : queries) {
+                global_db.execute_to_buffer(q, response, now);
+            }
+        }
+
         // Keep unparsed data for next iteration
         if (last_pos < remainder.size())
         {
-            if (last_pos > 0)
-            {
-                // Move unparsed data to front
-                remainder = remainder.substr(last_pos);
-            }
+            remainder = remainder.substr(last_pos);
         }
         else
         {
             remainder.clear();
-        }
-
-        if (queries.empty())
-            continue;
-
-        if (queries.size() == 1)
-        {
-            response = global_db.execute(queries[0]);
-        }
-        else
-        { // Modified to use global_pool for batch processing
-            unsigned int n_cores = std::thread::hardware_concurrency();
-            if (n_cores == 0)
-                n_cores = 2;
-            std::vector<std::string> chunk_res(n_cores);
-            size_t q_per_core = (queries.size() + n_cores - 1) / n_cores;
-
-            std::vector<std::future<void>> futures; // Using futures to wait for tasks
-            for (unsigned int t = 0; t < n_cores; ++t)
-            {
-                futures.push_back(global_pool->enqueue([&, t, q_per_core]()
-                                                       {
-                    size_t start = t * q_per_core;
-                    size_t end = std::min(start + q_per_core, queries.size());
-                    for (size_t i = start; i < end; ++i) {
-                        chunk_res[t] += global_db.execute(queries[i]);
-                    } }));
-            }
-            for (auto &f : futures)
-                f.get(); // Wait for all tasks to complete
-            for (const auto &r : chunk_res)
-                response += r;
         }
 
         if (!response.empty())

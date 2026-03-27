@@ -46,6 +46,7 @@ class Table
     std::vector<uint64_t> expires_at;
     std::shared_mutex rw_lock;
     size_t row_count = 0;
+    size_t version = 0;
 
 public:
     Table(const std::string &name, const std::vector<ColumnDef> &schema)
@@ -66,6 +67,7 @@ public:
             columns[i]->push_back(values[i]);
         }
         expires_at.push_back(expiry);
+        version++;
         return row_count++;
     }
 
@@ -96,6 +98,24 @@ public:
 
     // Lock-free row count — caller MUST hold at least a shared_lock on get_rw_lock()
     size_t get_row_count_nolock() const { return row_count; }
+
+    // Optimized row retrieval that appends directly to a buffer to avoid copies
+    void serialize_row_to_buffer(size_t row_index, std::string &buffer) const
+    {
+        for (const auto &col : columns)
+        {
+            buffer.append(col->get(row_index));
+            buffer.push_back('\t');
+        }
+    }
+
+    size_t get_version()
+    {
+        std::shared_lock lock(rw_lock);
+        return version;
+    }
+
+    size_t get_version_nolock() const { return version; }
 
     bool is_expired(size_t row_index, uint64_t current_time)
     {
@@ -178,6 +198,15 @@ public:
             expires_at.push_back(expiry);
             row_count++;
         }
+        version++;
         return true;
+    }
+    void clear()
+    {
+        std::unique_lock lock(rw_lock);
+        for (auto &col : columns) { col->clear(); }
+        expires_at.clear();
+        row_count = 0;
+        version++;
     }
 };

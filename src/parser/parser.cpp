@@ -194,6 +194,22 @@ namespace
             return false;
 
         q = trim(q.substr(5));
+        
+        bool if_not_exists = false;
+        if (starts_with_keyword(q, "IF"))
+        {
+            std::string_view q2 = trim(q.substr(2));
+            if (starts_with_keyword(q2, "NOT"))
+            {
+                std::string_view q3 = trim(q2.substr(3));
+                if (starts_with_keyword(q3, "EXISTS"))
+                {
+                    if_not_exists = true;
+                    q = trim(q3.substr(6));
+                }
+            }
+        }
+
         const size_t open_paren = q.find('(');
         const size_t close_paren = q.rfind(')');
 
@@ -215,6 +231,7 @@ namespace
 
         CreateTableQuery ct;
         ct.table_name = std::string(table_name);
+        ct.if_not_exists = if_not_exists;
 
         bool seen_primary = false;
         for (const std::string &col_def : col_defs)
@@ -297,83 +314,86 @@ namespace
         if (!is_valid_identifier(left))
             return false;
 
-        std::string_view rest = trim(q.substr(values_pos + 6));
-        if (rest.empty() || rest.front() != '(')
-            return false;
-
-        size_t close_paren = std::string::npos;
-        bool in_single_quote = false;
-        bool in_double_quote = false;
-        for (size_t i = 0; i < rest.size(); ++i)
-        {
-            const char c = rest[i];
-            if (c == '\'' && !in_double_quote)
-            {
-                in_single_quote = !in_single_quote;
-                continue;
-            }
-            if (c == '"' && !in_single_quote)
-            {
-                in_double_quote = !in_double_quote;
-                continue;
-            }
-
-            if (c == ')' && !in_single_quote && !in_double_quote)
-            {
-                close_paren = i;
-                break;
-            }
-        }
-
-        if (close_paren == std::string::npos)
-            return false;
-
-        const std::string_view values_part = rest.substr(1, close_paren - 1);
-        rest = trim(rest.substr(close_paren + 1));
-
         InsertQuery iq;
         iq.table_name = std::string(left);
         iq.expires_at = 0;
 
-        std::vector<std::string> raw_values;
-        if (!split_comma_list(values_part, raw_values, true))
-            return false;
+        std::string_view rest = trim(q.substr(values_pos + 6));
 
-        for (std::string token : raw_values)
+        while (!rest.empty() && rest.front() == '(')
         {
-            std::string_view val = trim(token);
-            if (val.size() >= 2)
+            size_t close_paren = std::string::npos;
+            bool in_single_quote = false;
+            bool in_double_quote = false;
+            for (size_t i = 0; i < rest.size(); ++i)
             {
-                if ((val.front() == '\'' && val.back() == '\'') ||
-                    (val.front() == '"' && val.back() == '"'))
+                const char c = rest[i];
+                if (c == '\'' && !in_double_quote)
                 {
-                    val = val.substr(1, val.size() - 2);
+                    in_single_quote = !in_single_quote;
+                    continue;
+                }
+                if (c == '"' && !in_single_quote)
+                {
+                    in_double_quote = !in_double_quote;
+                    continue;
+                }
+
+                if (c == ')' && !in_single_quote && !in_double_quote)
+                {
+                    close_paren = i;
+                    break;
                 }
             }
 
-            if (val.empty())
+            if (close_paren == std::string::npos)
+                break;
+
+            const std::string_view values_part = rest.substr(1, close_paren - 1);
+            std::vector<std::string> row;
+            std::vector<std::string> raw_values;
+            if (!split_comma_list(values_part, raw_values, true))
                 return false;
 
-            iq.values.emplace_back(val);
+            for (std::string token : raw_values)
+            {
+                std::string_view val = trim(token);
+                if (val.size() >= 2)
+                {
+                    if ((val.front() == '\'' && val.back() == '\'') ||
+                        (val.front() == '"' && val.back() == '"'))
+                    {
+                        val = val.substr(1, val.size() - 2);
+                    }
+                }
+                row.emplace_back(std::string(val));
+            }
+            iq.rows.push_back(std::move(row));
+
+            rest = trim(rest.substr(close_paren + 1));
+            if (!rest.empty() && rest.front() == ',')
+            {
+                rest = trim(rest.substr(1));
+            }
         }
 
-        if (iq.values.empty())
+        if (iq.rows.empty())
             return false;
 
         if (!rest.empty())
         {
-            if (!starts_with_keyword(rest, "EXPIRY"))
-                return false;
+            if (starts_with_keyword(rest, "EXPIRY"))
+            {
+                rest = trim(rest.substr(6));
+                uint64_t ttl = 0;
+                if (!parse_uint64(rest, ttl))
+                    return false;
 
-            rest = trim(rest.substr(6));
-            uint64_t ttl = 0;
-            if (!parse_uint64(rest, ttl))
-                return false;
-
-            const uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                                     std::chrono::system_clock::now().time_since_epoch())
-                                     .count();
-            iq.expires_at = now + ttl;
+                const uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count();
+                iq.expires_at = now + ttl;
+            }
         }
 
         result.type = QueryType::INSERT;
@@ -387,15 +407,22 @@ namespace
         if (where_text.empty())
             return false;
 
-        const size_t eq_pos = where_text.find('=');
-        if (eq_pos == std::string::npos)
+        size_t op_pos = std::string::npos;
+        size_t op_len = 0;
+        CompareOp op = CompareOp::EQ;
+
+        if ((op_pos = where_text.find(">=")) != std::string::npos) { op_len = 2; op = CompareOp::GTE; }
+        else if ((op_pos = where_text.find("<=")) != std::string::npos) { op_len = 2; op = CompareOp::LTE; }
+        else if ((op_pos = where_text.find("!=")) != std::string::npos) { op_len = 2; op = CompareOp::NEQ; }
+        else if ((op_pos = where_text.find(">")) != std::string::npos) { op_len = 1; op = CompareOp::GT; }
+        else if ((op_pos = where_text.find("<")) != std::string::npos) { op_len = 1; op = CompareOp::LT; }
+        else if ((op_pos = where_text.find("=")) != std::string::npos) { op_len = 1; op = CompareOp::EQ; }
+
+        if (op_pos == std::string::npos)
             return false;
 
-        if (where_text.find('=', eq_pos + 1) != std::string::npos)
-            return false;
-
-        std::string_view lhs = trim(where_text.substr(0, eq_pos));
-        std::string_view rhs = trim(where_text.substr(eq_pos + 1));
+        std::string_view lhs = trim(where_text.substr(0, op_pos));
+        std::string_view rhs = trim(where_text.substr(op_pos + op_len));
 
         if (lhs.empty() || rhs.empty())
             return false;
@@ -424,6 +451,7 @@ namespace
         sq.has_where = true;
         sq.where_column = std::string(lhs);
         sq.where_value = std::string(rhs);
+        sq.where_op = op;
         return true;
     }
 
@@ -447,6 +475,7 @@ namespace
         SelectQuery sq;
         sq.has_where = false;
         sq.is_join = false;
+        sq.has_order_by = false;
 
         if (cols_part == "*")
         {
@@ -516,8 +545,6 @@ namespace
             const size_t eq_pos = join_cond.find('=');
             if (eq_pos == std::string::npos)
                 return false;
-            if (join_cond.find('=', eq_pos + 1) != std::string::npos)
-                return false;
 
             std::string_view lhs = trim(join_cond.substr(0, eq_pos));
             std::string_view rhs = trim(join_cond.substr(eq_pos + 1));
@@ -527,46 +554,98 @@ namespace
             if (lhs_dot == std::string::npos || rhs_dot == std::string::npos)
                 return false;
 
-            std::string_view lhs_col = trim(lhs.substr(lhs_dot + 1));
-            std::string_view rhs_col = trim(rhs.substr(rhs_dot + 1));
-
-            if (!is_valid_identifier(lhs_col) || !is_valid_identifier(rhs_col))
-                return false;
-
-            sq.join_condition_col1 = std::string(lhs_col);
-            sq.join_condition_col2 = std::string(rhs_col);
+            sq.join_condition_col1 = std::string(trim(lhs.substr(lhs_dot + 1)));
+            sq.join_condition_col2 = std::string(trim(rhs.substr(rhs_dot + 1)));
 
             if (where_after_on != std::string::npos)
             {
                 std::string_view where_text = trim(on_rest.substr(where_after_on + 5));
-                if (!parse_where_clause(where_text, sq))
-                    return false;
+                const size_t order_pos = ifind_keyword(where_text, "ORDER BY");
+                if (order_pos != std::string::npos) {
+                    std::string_view actual_where = trim(where_text.substr(0, order_pos));
+                    if (!actual_where.empty() && !parse_where_clause(actual_where, sq)) return false;
+                    std::string_view order_text = trim(where_text.substr(order_pos + 8));
+                    std::stringstream ss((std::string(order_text)));
+                    std::string col; if (ss >> col) { sq.has_order_by = true; sq.order_by_column = col;
+                        std::string dir; if (ss >> dir) { std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper); if (dir == "DESC") sq.order_desc = true; }
+                    }
+                } else {
+                    if (!parse_where_clause(where_text, sq)) return false;
+                }
             }
         }
         else
         {
             const size_t local_where_pos = ifind_keyword(after_from, "WHERE");
-            std::string_view table_name = local_where_pos == std::string::npos
-                                              ? trim(after_from)
-                                              : trim(after_from.substr(0, local_where_pos));
+            const size_t local_order_pos = ifind_keyword(after_from, "ORDER BY");
 
-            if (!is_valid_identifier(table_name))
-                return false;
-            sq.table_name = std::string(table_name);
+            std::string_view table_name_view;
+            if (local_where_pos != std::string::npos) table_name_view = trim(after_from.substr(0, local_where_pos));
+            else if (local_order_pos != std::string::npos) table_name_view = trim(after_from.substr(0, local_order_pos));
+            else table_name_view = trim(after_from);
+
+            if (!is_valid_identifier(table_name_view)) return false;
+            sq.table_name = std::string(table_name_view);
 
             if (local_where_pos != std::string::npos)
             {
                 std::string_view where_text = trim(after_from.substr(local_where_pos + 5));
-                if (!parse_where_clause(where_text, sq))
-                    return false;
+                const size_t order_pos = ifind_keyword(where_text, "ORDER BY");
+                if (order_pos != std::string::npos)
+                {
+                    std::string_view actual_where = trim(where_text.substr(0, order_pos));
+                    if (!actual_where.empty() && !parse_where_clause(actual_where, sq)) return false;
+                    std::string_view order_text = trim(where_text.substr(order_pos + 8));
+                    std::stringstream ss((std::string(order_text)));
+                    std::string col; if (ss >> col) { sq.has_order_by = true; sq.order_by_column = col;
+                        std::string dir; if (ss >> dir) { std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper); if (dir == "DESC") sq.order_desc = true; }
+                    }
+                }
+                else
+                {
+                    if (!parse_where_clause(where_text, sq)) return false;
+                }
+            }
+            else if (local_order_pos != std::string::npos)
+            {
+                std::string_view order_text = trim(after_from.substr(local_order_pos + 8));
+                std::stringstream ss((std::string(order_text)));
+                std::string col; if (ss >> col) { sq.has_order_by = true; sq.order_by_column = col;
+                    std::string dir; if (ss >> dir) { std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper); if (dir == "DESC") sq.order_desc = true; }
+                }
             }
         }
 
-        if (sq.table_name.empty() || sq.columns.empty())
-            return false;
-
+        if (sq.table_name.empty() || sq.columns.empty()) return false;
         result.type = QueryType::SELECT;
         result.query = std::move(sq);
+        return true;
+    }
+
+    bool parse_delete(std::string_view q, ParsedQuery &result)
+    {
+        if (!starts_with_keyword(q, "DELETE")) return false;
+        q = trim(q.substr(6));
+        if (!starts_with_keyword(q, "FROM")) return false;
+        q = trim(q.substr(4));
+
+        const size_t where_pos = ifind_keyword(q, "WHERE");
+        std::string_view table_view = (where_pos == std::string::npos) ? q : trim(q.substr(0, where_pos));
+        if (!is_valid_identifier(table_view)) return false;
+
+        DeleteQuery dq;
+        dq.table_name = std::string(table_view);
+        if (where_pos != std::string::npos) {
+            SelectQuery dummy;
+            if (parse_where_clause(trim(q.substr(where_pos + 5)), dummy)) {
+                dq.has_where = true;
+                dq.where_column = dummy.where_column;
+                dq.where_value = dummy.where_value;
+                dq.where_op = dummy.where_op;
+            } else return false;
+        }
+        result.type = QueryType::DELETE;
+        result.query = std::move(dq);
         return true;
     }
 }
@@ -575,52 +654,23 @@ ParsedQuery Parser::parse(const std::string &sql)
 {
     ParsedQuery result;
     result.type = QueryType::UNKNOWN;
+    result.query = CheckpointQuery{};
 
     std::string_view q = trim(sql);
+    if (!q.empty() && q.back() == ';') { q.remove_suffix(1); q = trim(q); }
+    if (q.empty()) return result;
+    if (q.size() >= 2 && q[0] == '-' && q[1] == '-') return result;
 
-    // Strip one optional trailing semicolon then ensure no extra trailing tokens.
-    if (!q.empty() && q.back() == ';')
-    {
-        q.remove_suffix(1);
-        q = trim(q);
-    }
-
-    if (q.empty())
-        return result;
-
-    if (q.size() >= 2 && q[0] == '-' && q[1] == '-')
-        return result;
-
-    if (starts_with_keyword(q, "CHECKPOINT"))
-    {
-        if (!trim(q.substr(10)).empty())
-            return result;
-
+    if (starts_with_keyword(q, "CHECKPOINT")) {
         result.type = QueryType::CHECKPOINT;
         result.query = CheckpointQuery{};
         return result;
     }
 
-    if (starts_with_keyword(q, "CREATE"))
-    {
-        if (parse_create_table(q, result))
-            return result;
-        return ParsedQuery{QueryType::UNKNOWN, CreateTableQuery{}};
-    }
-
-    if (starts_with_keyword(q, "INSERT"))
-    {
-        if (parse_insert(q, result))
-            return result;
-        return ParsedQuery{QueryType::UNKNOWN, CreateTableQuery{}};
-    }
-
-    if (starts_with_keyword(q, "SELECT"))
-    {
-        if (parse_select(q, result))
-            return result;
-        return ParsedQuery{QueryType::UNKNOWN, CreateTableQuery{}};
-    }
+    if (starts_with_keyword(q, "CREATE")) { if (parse_create_table(q, result)) return result; }
+    else if (starts_with_keyword(q, "INSERT")) { if (parse_insert(q, result)) return result; }
+    else if (starts_with_keyword(q, "SELECT")) { if (parse_select(q, result)) return result; }
+    else if (starts_with_keyword(q, "DELETE")) { if (parse_delete(q, result)) return result; }
 
     return result;
 }

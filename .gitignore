@@ -44,3 +44,8 @@
 # Local bin and build directories
 bin/
 build/
+data/checkpoint.meta
+*.data
+*.schema
+*.idx
+
