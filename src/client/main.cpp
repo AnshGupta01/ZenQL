@@ -1,68 +1,54 @@
-#include <iostream>
-#include <string>
 #include "flexql.h"
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <iostream>
 
-int callback(void *data, int columnCount, char **values, char **columnNames) {
-    (void)data;
-    for(int i = 0; i < columnCount; i++) {
-        std::cout << columnNames[i] << " = " << (values[i] ? values[i] : "NULL") << "\n";
+// ─── Callback: print one row ──────────────────────────────────────────────────
+static int print_row(void* /*data*/, int ncols, char** vals, char** names) {
+    for (int i = 0; i < ncols; i++) {
+        printf("%s = %s\n", names[i], vals[i] ? vals[i] : "NULL");
     }
-    std::cout << std::endl;
+    printf("\n");
     return 0;
 }
 
-int main() {
-    FlexQL *db = nullptr;
-    int rc = flexql_open("127.0.0.1", 9000, &db);
-    
+// ─── REPL ────────────────────────────────────────────────────────────────────
+int main(int argc, char** argv) {
+    const char* host = "127.0.0.1";
+    int port = 9000;
+    if (argc > 1) host = argv[1];
+    if (argc > 2) port = std::atoi(argv[2]);
+
+    FlexQL* db = nullptr;
+    int rc = flexql_open(host, port, &db);
     if (rc != FLEXQL_OK) {
-        std::cerr << "Failed to connect to FlexQL server at 127.0.0.1:9000" << std::endl;
+        fprintf(stderr, "Cannot connect to FlexQL server at %s:%d\n", host, port);
         return 1;
     }
-    std::cout << "Connected to FlexQL server.\nType 'exit' to quit.\n";
+    printf("Connected to FlexQL server at %s:%d\n", host, port);
+    printf("Type SQL queries (end with ;). Type .exit or Ctrl-D to quit.\n\n");
 
-    std::string line;
-    std::string query_buffer;
-    char *errMsg = nullptr;
-
+    std::string acc;
     while (true) {
-        if (query_buffer.empty()) {
-            std::cout << "flexql> ";
-        } else {
-            std::cout << "    ...> ";
-        }
-
+        printf(acc.empty() ? "flexql> " : "     -> ");
+        fflush(stdout);
+        std::string line;
         if (!std::getline(std::cin, line)) break;
-        
-        if (line == "exit" || line == "quit") {
-            break;
-        }
+        if (line == ".exit" || line == "\\q") break;
 
-        // Basic comment skipping
-        size_t comment_pos = line.find("--");
-        if (comment_pos != std::string::npos) {
-            line = line.substr(0, comment_pos);
-        }
-
-        if (line.find_first_not_of(" \n\r\t") == std::string::npos) continue;
-
-        // Trim whitespace
-        line.erase(0, line.find_first_not_of(" \n\r\t"));
-        line.erase(line.find_last_not_of(" \n\r\t") + 1);
-
-        if (line.empty()) continue;
-
-        query_buffer += (query_buffer.empty() ? "" : " ") + line;
-
-        // Check for semicolon
-        if (query_buffer.back() == ';') {
-            rc = flexql_exec(db, query_buffer.c_str(), callback, nullptr, &errMsg);
-            if (rc != FLEXQL_OK) {
-                std::cerr << "Error: " << (errMsg ? errMsg : "Unknown") << std::endl;
-                flexql_free(errMsg);
-                errMsg = nullptr;
+        acc += " " + line;
+        // Execute when we see a semicolon (possibly multiple stmts)
+        if (!acc.empty() && acc.find(';') != std::string::npos) {
+            char* errmsg = nullptr;
+            rc = flexql_exec(db, acc.c_str(), print_row, nullptr, &errmsg);
+            if (rc != FLEXQL_OK && errmsg) {
+                fprintf(stderr, "Error: %s\n", errmsg);
+                flexql_free(errmsg);
+            } else if (rc == FLEXQL_OK) {
+                printf("Query executed successfully\n");
             }
-            query_buffer.clear();
+            acc.clear();
         }
     }
 

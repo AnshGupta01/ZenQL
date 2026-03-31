@@ -24,13 +24,15 @@
 ## ⚡ Quick Start
 
 ### Build
+
 ```bash
 make clean && make
 ```
 
 ### Run
+
 1. **Server**: `make run-server`
-2. **REPL**: `make run-repl`
+2. **REPL**: `make run-client`
 3. **Benchmark**: `make run-benchmark ARGS="10000000"`
 
 ---
@@ -40,7 +42,7 @@ make clean && make
 ZenQL is optimized for high-throughput, in-memory analytical workloads:
 
 - **Columnar Storage**: Data is stored in decomposed vectors (`StringColumn`) rather than row-based structs, significantly improving cache locality for filtered scans and joins.
-- **Multi-Layered Caching**: 
+- **Multi-Layered Caching**:
   - **Thread-Local TableCache**: Minimizes lock contention for frequent point-lookups.
   - **Versioned JoinCache**: Uses a "build-once, probe-many" strategy for hash joins, invalidated only on table mutations.
 - **ThreadPool Concurrency**: A fixed-size thread pool manages both connection handling and parallelized query execution (e.g., parallelized join probing).
@@ -60,8 +62,8 @@ ZenQL is optimized for high-throughput, in-memory analytical workloads:
 
 ## Benchmark results (10M Rows)
 
-| Date | Rows | Elapsed | Throughput | Unit Tests |
-| :--- | :--- | :--- | :--- | :--- |
+| Date       | Rows       | Elapsed   | Throughput           | Unit Tests   |
+| :--------- | :--------- | :-------- | :------------------- | :----------- |
 | 2026-03-31 | 10,000,000 | 21,651 ms | **461,872 rows/sec** | 22/22 (100%) |
 
 ---

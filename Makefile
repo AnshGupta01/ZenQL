@@ -1,70 +1,88 @@
-CXX = g++
-CXXFLAGS = -std=c++17 -Iinclude -Wall -Wextra -O3 -march=native -pthread -DNDEBUG -flto -funroll-loops
+CXX      := g++
+CXXFLAGS := -std=c++17 -O3 -march=native -funroll-loops -ffast-math \
+            -Wall -Wextra -Wno-unused-parameter \
+            -Iinclude
+LDFLAGS  := -lpthread
 
-# Directories
-SRC_DIR = src
-INC_DIR = include
-BUILD_DIR = build
-BIN_DIR = bin
+# ─── Directories ─────────────────────────────────────────────────────────────
+BUILDDIR := build
+BINDIR   := bin
 
-# Source files
-CLIENT_LIB_SRCS = $(SRC_DIR)/client/libflexql.cpp
-SERVER_SRCS = $(SRC_DIR)/server/server.cpp $(SRC_DIR)/parser/parser.cpp $(SRC_DIR)/storage/checkpoint_manager.cpp $(SRC_DIR)/query/optimized_database.cpp
-REPL_SRCS = $(SRC_DIR)/client/main.cpp
+# ─── Sources ─────────────────────────────────────────────────────────────────
+STORAGE_SRCS   := src/storage/pager.cpp \
+                  src/storage/row.cpp   \
+                  src/storage/table.cpp
 
-# Object files
-CLIENT_LIB_OBJS = $(patsubst $(SRC_DIR)/%.cpp, $(BUILD_DIR)/%.o, $(CLIENT_LIB_SRCS))
-SERVER_OBJS = $(patsubst $(SRC_DIR)/%.cpp, $(BUILD_DIR)/%.o, $(SERVER_SRCS))
-REPL_OBJS = $(patsubst $(SRC_DIR)/%.cpp, $(BUILD_DIR)/%.o, $(REPL_SRCS))
+INDEX_SRCS     := src/index/bptree.cpp
 
-# Targets
-LIBRARY = $(BIN_DIR)/libflexql.a
-SERVER = $(BIN_DIR)/flexql_server
-REPL = $(BIN_DIR)/flexql_repl
-FLEXQL_BENCHMARK = $(BIN_DIR)/benchmark_flexql
+CACHE_SRCS     :=   # LRU is inside Pager
 
-all: dirs $(LIBRARY) $(SERVER) $(REPL) $(FLEXQL_BENCHMARK)
+PARSER_SRCS    := src/parser/parser.cpp
 
+QUERY_SRCS     := src/query/executor.cpp
+
+CONCURR_SRCS   := src/concurrency/thread_pool.cpp
+
+NETWORK_SRCS   := src/network/protocol.cpp
+
+COMMON_SRCS    := $(STORAGE_SRCS) $(INDEX_SRCS) $(PARSER_SRCS) \
+                  $(QUERY_SRCS) $(CONCURR_SRCS) $(NETWORK_SRCS)
+
+SERVER_SRCS    := src/server/main.cpp
+CLIENT_SRCS    := src/client/main.cpp        src/network/client.cpp
+BENCH_SRCS     := benchmarks/benchmark_flexql.cpp src/network/client.cpp
+
+# ─── Object files ────────────────────────────────────────────────────────────
+COMMON_OBJS := $(COMMON_SRCS:%.cpp=$(BUILDDIR)/%.o)
+SERVER_OBJS := $(SERVER_SRCS:%.cpp=$(BUILDDIR)/%.o)
+CLIENT_OBJS := $(CLIENT_SRCS:%.cpp=$(BUILDDIR)/%.o)
+BENCH_OBJS  := $(BENCH_SRCS:%.cpp=$(BUILDDIR)/%.o)
+
+ALL_OBJS := $(COMMON_OBJS) $(SERVER_OBJS) $(CLIENT_OBJS) $(BENCH_OBJS)
+
+# ─── Targets ─────────────────────────────────────────────────────────────────
+.PHONY: all server client benchmark clean dirs
+
+all: dirs server client benchmark
+
+server: dirs $(BINDIR)/flexql_server
+
+client: dirs $(BINDIR)/flexql_client
+
+benchmark: dirs $(BINDIR)/flexql_master_benchmark
+
+$(BINDIR)/flexql_server: $(COMMON_OBJS) $(SERVER_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "  ✓ Built $@"
+
+$(BINDIR)/flexql_client: $(COMMON_OBJS) $(CLIENT_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "  ✓ Built $@"
+
+$(BINDIR)/flexql_master_benchmark: $(COMMON_OBJS) $(BENCH_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "  ✓ Built $@"
+
+run-server: server
+	./$(BINDIR)/flexql_server
+
+run-client: client
+	./$(BINDIR)/flexql_client
+
+# ─── Compilation rule ────────────────────────────────────────────────────────
+$(BUILDDIR)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 dirs:
-	@mkdir -p $(BUILD_DIR)/client $(BUILD_DIR)/server $(BUILD_DIR)/parser $(BUILD_DIR)/storage $(BUILD_DIR)/query $(BUILD_DIR)/benchmarks $(BIN_DIR)
-
-$(LIBRARY): $(CLIENT_LIB_OBJS)
-	ar rcs $@ $^
-
-$(SERVER): $(SERVER_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@
-
-$(REPL): $(REPL_OBJS) $(LIBRARY)
-	$(CXX) $(CXXFLAGS) $(REPL_OBJS) -L$(BIN_DIR) -lflexql -o $@
-
-$(FLEXQL_BENCHMARK): $(BUILD_DIR)/benchmarks/benchmark_flexql.o $(LIBRARY)
-	$(CXX) $(CXXFLAGS) $< -L$(BIN_DIR) -lflexql -o $@
-
-run-benchmark: $(FLEXQL_BENCHMARK) $(SERVER)
-	@pkill flexql_server || true
-	@./$(SERVER) &
-	@sleep 0.5
-	@./$(FLEXQL_BENCHMARK) $(ARGS)
-
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/benchmarks/%.o: benchmarks/%.cpp
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	@mkdir -p $(BINDIR) $(BUILDDIR)
+	@mkdir -p data/tables data/indexes data/wal
 
 clean:
-	rm -rf $(BUILD_DIR) $(BIN_DIR)
+	rm -rf $(BUILDDIR) $(BINDIR)
+	@echo "  ✓ Cleaned"
 
-run-server: $(SERVER)
-	@pkill flexql_server || true
-	@./$(SERVER)
-
-run-repl: $(REPL)
-	@./$(REPL)
-
-.PHONY: all dirs clean run-server run-repl run-benchmark
-
-bin/flexql_bulk_ingest_benchmark: benchmarks/bulk_ingest_benchmark.cpp bin/libflexql.a
-	$(CXX) $(CXXFLAGS) $< -Lbin -lflexql -o $@
+purge: clean
+	rm -rf data/tables/* data/indexes/* data/wal/*
+	@echo "  ✓ Data purged"

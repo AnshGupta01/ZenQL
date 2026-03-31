@@ -1,824 +1,308 @@
-#include "parser.h"
-
-#include <algorithm>
-#include <chrono>
+#include "parser/parser.h"
 #include <cctype>
-#include <cstring>
-#include <limits>
+#include <algorithm>
+#include <stdexcept>
 #include <sstream>
-#include <string_view>
 
-namespace
-{
-    inline std::string_view trim(std::string_view sv)
-    {
-        size_t start = 0;
-        while (start < sv.size() && std::isspace(static_cast<unsigned char>(sv[start])))
-            ++start;
+// ─── Tokenizer ───────────────────────────────────────────────────────────────
+// Splits SQL into tokens. Handles:
+//  - Quoted strings: 'hello world'  → single token (without quotes)
+//  - Parentheses, comma, semicolon: each is its own token
+//  - Numbers, identifiers: whitespace-delimited
 
-        size_t end = sv.size();
-        while (end > start && std::isspace(static_cast<unsigned char>(sv[end - 1])))
-            --end;
-
-        return sv.substr(start, end - start);
-    }
-
-    inline bool iequals(std::string_view a, std::string_view b)
-    {
-        if (a.size() != b.size())
-            return false;
-
-        for (size_t i = 0; i < a.size(); ++i)
-        {
-            if (std::toupper(static_cast<unsigned char>(a[i])) !=
-                std::toupper(static_cast<unsigned char>(b[i])))
-            {
-                return false;
+void Parser::tokenize(const std::string& sql) {
+    tokens_.clear();
+    pos_ = 0;
+    size_t i = 0, n = sql.size();
+    while (i < n) {
+        char c = sql[i];
+        if (std::isspace((unsigned char)c)) { i++; continue; }
+        if (c == '\'') {
+            // Quoted string
+            size_t j = i + 1;
+            while (j < n && sql[j] != '\'') j++;
+            tokens_.push_back(std::string_view(sql.data() + i + 1, j - i - 1));
+            i = j + 1;
+        } else if (c == '(' || c == ')' || c == ',' || c == ';') {
+            tokens_.push_back(std::string_view(sql.data() + i, 1));
+            i++;
+        } else if (c == '<' || c == '>' || c == '=') {
+            // Handle <=, >=
+            if (i + 1 < n && sql[i+1] == '=') {
+                tokens_.push_back(std::string_view(sql.data() + i, 2));
+                i += 2;
+            } else {
+                tokens_.push_back(std::string_view(sql.data() + i, 1));
+                i++;
             }
+        } else if (c == '.') {
+            // Dot attached to previous token (table.column)
+            if (!tokens_.empty() && tokens_.back().data() + tokens_.back().size() == sql.data() + i) {
+                // peek forward
+                size_t j = i + 1;
+                while (j < n && (std::isalnum((unsigned char)sql[j]) || sql[j] == '_')) j++;
+                // Expand the string_view window perfectly!
+                tokens_.back() = std::string_view(tokens_.back().data(), tokens_.back().size() + (j - i));
+                i = j;
+            } else {
+                i++;
+            }
+        } else {
+            // Identifier / number
+            size_t j = i;
+            while (j < n && !std::isspace((unsigned char)sql[j]) &&
+                   sql[j] != '(' && sql[j] != ')' && sql[j] != ',' &&
+                   sql[j] != ';' && sql[j] != '\'' && sql[j] != '=' &&
+                   sql[j] != '<' && sql[j] != '>') {
+                j++;
+            }
+            tokens_.push_back(std::string_view(sql.data() + i, j - i));
+            i = j;
         }
-        return true;
-    }
-
-    inline bool starts_with_keyword(std::string_view sv, const char *keyword)
-    {
-        const size_t len = std::strlen(keyword);
-        if (sv.size() < len)
-            return false;
-
-        std::string_view head = sv.substr(0, len);
-        if (!iequals(head, std::string_view(keyword, len)))
-            return false;
-
-        if (sv.size() == len)
-            return true;
-
-        return std::isspace(static_cast<unsigned char>(sv[len])) != 0;
-    }
-
-    size_t ifind_keyword(std::string_view sv, const char *keyword)
-    {
-        const size_t klen = std::strlen(keyword);
-        if (klen == 0 || sv.size() < klen)
-            return std::string::npos;
-
-        for (size_t i = 0; i + klen <= sv.size(); ++i)
-        {
-            bool match = true;
-            for (size_t j = 0; j < klen; ++j)
-            {
-                if (std::toupper(static_cast<unsigned char>(sv[i + j])) !=
-                    std::toupper(static_cast<unsigned char>(keyword[j])))
-                {
-                    match = false;
-                    break;
-                }
-            }
-
-            if (!match)
-                continue;
-
-            const bool left_ok = (i == 0) || std::isspace(static_cast<unsigned char>(sv[i - 1]));
-            const bool right_ok = (i + klen == sv.size()) || std::isspace(static_cast<unsigned char>(sv[i + klen]));
-
-            if (left_ok && right_ok)
-                return i;
-        }
-
-        return std::string::npos;
-    }
-
-    inline bool is_identifier_char(char c)
-    {
-        const unsigned char uc = static_cast<unsigned char>(c);
-        return std::isalnum(uc) || c == '_';
-    }
-
-    bool is_valid_identifier(std::string_view id)
-    {
-        if (id.empty())
-            return false;
-
-        const unsigned char first = static_cast<unsigned char>(id.front());
-        if (!(std::isalpha(first) || id.front() == '_'))
-            return false;
-
-        for (char c : id)
-        {
-            if (!is_identifier_char(c))
-                return false;
-        }
-        return true;
-    }
-
-    bool parse_uint64(std::string_view text, uint64_t &out)
-    {
-        text = trim(text);
-        if (text.empty())
-            return false;
-
-        uint64_t value = 0;
-        for (char c : text)
-        {
-            if (!std::isdigit(static_cast<unsigned char>(c)))
-                return false;
-            const uint64_t digit = static_cast<uint64_t>(c - '0');
-            if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10)
-                return false;
-            value = value * 10 + digit;
-        }
-
-        out = value;
-        return true;
-    }
-
-    bool split_comma_list(std::string_view input, std::vector<std::string> &out, bool allow_quotes)
-    {
-        out.clear();
-
-        std::string token;
-        token.reserve(input.size());
-
-        bool in_single_quote = false;
-        bool in_double_quote = false;
-
-        for (size_t i = 0; i < input.size(); ++i)
-        {
-            const char c = input[i];
-
-            if (allow_quotes)
-            {
-                if (c == '\'' && !in_double_quote)
-                {
-                    in_single_quote = !in_single_quote;
-                    token.push_back(c);
-                    continue;
-                }
-                if (c == '"' && !in_single_quote)
-                {
-                    in_double_quote = !in_double_quote;
-                    token.push_back(c);
-                    continue;
-                }
-            }
-
-            if (c == ',' && !in_single_quote && !in_double_quote)
-            {
-                std::string_view part = trim(token);
-                if (part.empty())
-                    return false;
-                out.emplace_back(part);
-                token.clear();
-                continue;
-            }
-
-            token.push_back(c);
-        }
-
-        if (in_single_quote || in_double_quote)
-            return false;
-
-        std::string_view last = trim(token);
-        if (last.empty())
-            return false;
-        out.emplace_back(last);
-        return true;
-    }
-
-    bool parse_create_table(std::string_view q, ParsedQuery &result)
-    {
-        if (!starts_with_keyword(q, "CREATE"))
-            return false;
-
-        q = trim(q.substr(6));
-        if (!starts_with_keyword(q, "TABLE"))
-            return false;
-
-        q = trim(q.substr(5));
-
-        bool if_not_exists = false;
-        if (starts_with_keyword(q, "IF"))
-        {
-            std::string_view q2 = trim(q.substr(2));
-            if (starts_with_keyword(q2, "NOT"))
-            {
-                std::string_view q3 = trim(q2.substr(3));
-                if (starts_with_keyword(q3, "EXISTS"))
-                {
-                    if_not_exists = true;
-                    q = trim(q3.substr(6));
-                }
-            }
-        }
-
-        const size_t open_paren = q.find('(');
-        const size_t close_paren = q.rfind(')');
-
-        if (open_paren == std::string::npos || close_paren == std::string::npos || close_paren <= open_paren)
-            return false;
-
-        const std::string_view table_name = trim(q.substr(0, open_paren));
-        if (!is_valid_identifier(table_name))
-            return false;
-
-        // Ensure no tokens after trailing ')'.
-        if (!trim(q.substr(close_paren + 1)).empty())
-            return false;
-
-        const std::string_view cols_raw = q.substr(open_paren + 1, close_paren - open_paren - 1);
-        std::vector<std::string> col_defs;
-        if (!split_comma_list(cols_raw, col_defs, false))
-            return false;
-
-        CreateTableQuery ct;
-        ct.table_name = std::string(table_name);
-        ct.if_not_exists = if_not_exists;
-
-        bool seen_primary = false;
-        for (const std::string &col_def : col_defs)
-        {
-            std::stringstream ss(col_def);
-            std::string name;
-            std::string type;
-            if (!(ss >> name >> type))
-                return false;
-
-            if (!is_valid_identifier(name))
-                return false;
-
-            ColumnDef col;
-            col.name = name;
-            col.type = ColumnDef::parse_type_string(type);
-
-            std::vector<std::string> extras;
-            std::string extra;
-            while (ss >> extra)
-                extras.push_back(extra);
-
-            if (!extras.empty())
-            {
-                if (extras.size() == 2)
-                {
-                    std::string a = extras[0];
-                    std::string b = extras[1];
-                    std::transform(a.begin(), a.end(), a.begin(), ::toupper);
-                    std::transform(b.begin(), b.end(), b.begin(), ::toupper);
-                    if (a == "PRIMARY" && b == "KEY")
-                    {
-                        col.is_primary_key = true;
-                    }
-                    else
-                    {
-                        return false;
-                    }
-                }
-                else
-                {
-                    return false;
-                }
-            }
-
-            if (col.is_primary_key)
-            {
-                if (seen_primary)
-                    return false;
-                seen_primary = true;
-            }
-
-            ct.columns.push_back(col);
-        }
-
-        if (ct.columns.empty())
-            return false;
-
-        result.type = QueryType::CREATE_TABLE;
-        result.query = std::move(ct);
-        return true;
-    }
-
-    bool parse_insert(std::string_view q, ParsedQuery &result)
-    {
-        if (!starts_with_keyword(q, "INSERT"))
-            return false;
-
-        q = trim(q.substr(6));
-        if (!starts_with_keyword(q, "INTO"))
-            return false;
-
-        q = trim(q.substr(4));
-
-        const size_t values_pos = ifind_keyword(q, "VALUES");
-        if (values_pos == std::string::npos)
-            return false;
-
-        std::string_view left = trim(q.substr(0, values_pos));
-        if (!is_valid_identifier(left))
-            return false;
-
-        InsertQuery iq;
-        iq.table_name = std::string(left);
-        iq.expires_at = 0;
-
-        std::string_view rest = trim(q.substr(values_pos + 6));
-
-        while (!rest.empty() && rest.front() == '(')
-        {
-            size_t close_paren = std::string::npos;
-            bool in_single_quote = false;
-            bool in_double_quote = false;
-            for (size_t i = 0; i < rest.size(); ++i)
-            {
-                const char c = rest[i];
-                if (c == '\'' && !in_double_quote)
-                {
-                    in_single_quote = !in_single_quote;
-                    continue;
-                }
-                if (c == '"' && !in_single_quote)
-                {
-                    in_double_quote = !in_double_quote;
-                    continue;
-                }
-
-                if (c == ')' && !in_single_quote && !in_double_quote)
-                {
-                    close_paren = i;
-                    break;
-                }
-            }
-
-            if (close_paren == std::string::npos)
-                break;
-
-            const std::string_view values_part = rest.substr(1, close_paren - 1);
-            std::vector<std::string> row;
-            std::vector<std::string> raw_values;
-            if (!split_comma_list(values_part, raw_values, true))
-                return false;
-
-            for (std::string token : raw_values)
-            {
-                std::string_view val = trim(token);
-                if (val.size() >= 2)
-                {
-                    if ((val.front() == '\'' && val.back() == '\'') ||
-                        (val.front() == '"' && val.back() == '"'))
-                    {
-                        val = val.substr(1, val.size() - 2);
-                    }
-                }
-                row.emplace_back(std::string(val));
-            }
-            iq.rows.push_back(std::move(row));
-
-            rest = trim(rest.substr(close_paren + 1));
-            if (!rest.empty() && rest.front() == ',')
-            {
-                rest = trim(rest.substr(1));
-            }
-        }
-
-        if (iq.rows.empty())
-            return false;
-
-        if (!rest.empty())
-        {
-            if (starts_with_keyword(rest, "EXPIRY"))
-            {
-                rest = trim(rest.substr(6));
-                uint64_t ttl = 0;
-                if (!parse_uint64(rest, ttl))
-                    return false;
-
-                const uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                                         std::chrono::system_clock::now().time_since_epoch())
-                                         .count();
-                iq.expires_at = now + ttl;
-            }
-        }
-
-        result.type = QueryType::INSERT;
-        result.query = std::move(iq);
-        return true;
-    }
-
-    bool parse_where_clause(std::string_view where_text, SelectQuery &sq)
-    {
-        where_text = trim(where_text);
-        if (where_text.empty())
-            return false;
-
-        size_t op_pos = std::string::npos;
-        size_t op_len = 0;
-        CompareOp op = CompareOp::EQ;
-
-        if ((op_pos = where_text.find(">=")) != std::string::npos)
-        {
-            op_len = 2;
-            op = CompareOp::GTE;
-        }
-        else if ((op_pos = where_text.find("<=")) != std::string::npos)
-        {
-            op_len = 2;
-            op = CompareOp::LTE;
-        }
-        else if ((op_pos = where_text.find(">")) != std::string::npos)
-        {
-            op_len = 1;
-            op = CompareOp::GT;
-        }
-        else if ((op_pos = where_text.find("<")) != std::string::npos)
-        {
-            op_len = 1;
-            op = CompareOp::LT;
-        }
-        else if ((op_pos = where_text.find("=")) != std::string::npos)
-        {
-            op_len = 1;
-            op = CompareOp::EQ;
-        }
-
-        if (op_pos == std::string::npos)
-            return false;
-
-        std::string_view lhs = trim(where_text.substr(0, op_pos));
-        std::string_view rhs = trim(where_text.substr(op_pos + op_len));
-
-        if (lhs.empty() || rhs.empty())
-            return false;
-
-        const size_t dot = lhs.find('.');
-        if (dot != std::string::npos)
-        {
-            lhs = lhs.substr(dot + 1);
-        }
-
-        if (!is_valid_identifier(lhs))
-            return false;
-
-        if (rhs.size() >= 2)
-        {
-            if ((rhs.front() == '\'' && rhs.back() == '\'') ||
-                (rhs.front() == '"' && rhs.back() == '"'))
-            {
-                rhs = rhs.substr(1, rhs.size() - 2);
-            }
-        }
-
-        if (rhs.empty())
-            return false;
-
-        sq.has_where = true;
-        sq.where_column = std::string(lhs);
-        sq.where_value = std::string(rhs);
-        sq.where_op = op;
-        return true;
-    }
-
-    bool parse_select(std::string_view q, ParsedQuery &result)
-    {
-        if (!starts_with_keyword(q, "SELECT"))
-            return false;
-
-        q = trim(q.substr(6));
-
-        const size_t from_pos = ifind_keyword(q, "FROM");
-        if (from_pos == std::string::npos)
-            return false;
-
-        std::string_view cols_part = trim(q.substr(0, from_pos));
-        std::string_view after_from = trim(q.substr(from_pos + 4));
-
-        if (cols_part.empty() || after_from.empty())
-            return false;
-
-        SelectQuery sq;
-        sq.has_where = false;
-        sq.is_join = false;
-        sq.has_order_by = false;
-
-        if (cols_part == "*")
-        {
-            sq.columns.push_back("*");
-        }
-        else
-        {
-            std::vector<std::string> cols;
-            if (!split_comma_list(cols_part, cols, false))
-                return false;
-
-            for (const std::string &col_raw : cols)
-            {
-                std::string_view col = trim(col_raw);
-                if (col.empty())
-                    return false;
-
-                const size_t dot = col.find('.');
-                if (dot != std::string::npos)
-                {
-                    std::string_view table = col.substr(0, dot);
-                    std::string_view cname = col.substr(dot + 1);
-                    if (!is_valid_identifier(table) || !is_valid_identifier(cname))
-                        return false;
-                    sq.columns.emplace_back(col);
-                }
-                else
-                {
-                    if (!is_valid_identifier(col))
-                        return false;
-                    sq.columns.emplace_back(col);
-                }
-            }
-        }
-
-        const size_t join_pos = ifind_keyword(after_from, "INNER JOIN");
-
-        if (join_pos != std::string::npos)
-        {
-            sq.is_join = true;
-
-            std::string_view base_table = trim(after_from.substr(0, join_pos));
-            if (!is_valid_identifier(base_table))
-                return false;
-            sq.table_name = std::string(base_table);
-
-            std::string_view join_rest = trim(after_from.substr(join_pos + 10));
-            if (join_rest.empty())
-                return false;
-
-            const size_t on_pos = ifind_keyword(join_rest, "ON");
-            if (on_pos == std::string::npos)
-                return false;
-
-            std::string_view join_table = trim(join_rest.substr(0, on_pos));
-            if (!is_valid_identifier(join_table))
-                return false;
-            sq.join_table = std::string(join_table);
-
-            std::string_view on_rest = trim(join_rest.substr(on_pos + 2));
-            const size_t where_after_on = ifind_keyword(on_rest, "WHERE");
-            const size_t order_after_on = ifind_keyword(on_rest, "ORDER BY");
-
-            std::string_view join_cond;
-            if (where_after_on != std::string::npos)
-            {
-                join_cond = trim(on_rest.substr(0, where_after_on));
-            }
-            else if (order_after_on != std::string::npos)
-            {
-                join_cond = trim(on_rest.substr(0, order_after_on));
-            }
-            else
-            {
-                join_cond = on_rest;
-            }
-
-            size_t op_pos = std::string::npos;
-            size_t op_len = 0;
-            CompareOp join_op = CompareOp::EQ;
-            if ((op_pos = join_cond.find(">=")) != std::string::npos)
-            {
-                op_len = 2;
-                join_op = CompareOp::GTE;
-            }
-            else if ((op_pos = join_cond.find("<=")) != std::string::npos)
-            {
-                op_len = 2;
-                join_op = CompareOp::LTE;
-            }
-            else if ((op_pos = join_cond.find(">")) != std::string::npos)
-            {
-                op_len = 1;
-                join_op = CompareOp::GT;
-            }
-            else if ((op_pos = join_cond.find("<")) != std::string::npos)
-            {
-                op_len = 1;
-                join_op = CompareOp::LT;
-            }
-            else if ((op_pos = join_cond.find("=")) != std::string::npos)
-            {
-                op_len = 1;
-                join_op = CompareOp::EQ;
-            }
-            if (op_pos == std::string::npos)
-                return false;
-
-            std::string_view lhs = trim(join_cond.substr(0, op_pos));
-            std::string_view rhs = trim(join_cond.substr(op_pos + op_len));
-
-            const size_t lhs_dot = lhs.find('.');
-            const size_t rhs_dot = rhs.find('.');
-            if (lhs_dot == std::string::npos || rhs_dot == std::string::npos)
-                return false;
-
-            sq.join_condition_col1 = std::string(trim(lhs.substr(lhs_dot + 1)));
-            sq.join_condition_col2 = std::string(trim(rhs.substr(rhs_dot + 1)));
-            sq.join_op = join_op;
-
-            if (where_after_on != std::string::npos)
-            {
-                std::string_view where_text = trim(on_rest.substr(where_after_on + 5));
-                const size_t order_pos = ifind_keyword(where_text, "ORDER BY");
-                if (order_pos != std::string::npos)
-                {
-                    std::string_view actual_where = trim(where_text.substr(0, order_pos));
-                    if (!actual_where.empty() && !parse_where_clause(actual_where, sq))
-                        return false;
-                    std::string_view order_text = trim(where_text.substr(order_pos + 8));
-                    std::stringstream ss((std::string(order_text)));
-                    std::string col;
-                    if (ss >> col)
-                    {
-                        sq.has_order_by = true;
-                        sq.order_by_column = col;
-                        std::string dir;
-                        if (ss >> dir)
-                        {
-                            std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper);
-                            if (dir == "DESC")
-                                sq.order_desc = true;
-                        }
-                    }
-                }
-                else
-                {
-                    if (!parse_where_clause(where_text, sq))
-                        return false;
-                }
-            }
-            else if (order_after_on != std::string::npos)
-            {
-                std::string_view order_text = trim(on_rest.substr(order_after_on + 8));
-                std::stringstream ss((std::string(order_text)));
-                std::string col;
-                if (ss >> col)
-                {
-                    sq.has_order_by = true;
-                    sq.order_by_column = col;
-                    std::string dir;
-                    if (ss >> dir)
-                    {
-                        std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper);
-                        if (dir == "DESC")
-                            sq.order_desc = true;
-                    }
-                }
-            }
-        }
-        else
-        {
-            const size_t local_where_pos = ifind_keyword(after_from, "WHERE");
-            const size_t local_order_pos = ifind_keyword(after_from, "ORDER BY");
-
-            std::string_view table_name_view;
-            if (local_where_pos != std::string::npos)
-                table_name_view = trim(after_from.substr(0, local_where_pos));
-            else if (local_order_pos != std::string::npos)
-                table_name_view = trim(after_from.substr(0, local_order_pos));
-            else
-                table_name_view = trim(after_from);
-
-            if (!is_valid_identifier(table_name_view))
-                return false;
-            sq.table_name = std::string(table_name_view);
-
-            if (local_where_pos != std::string::npos)
-            {
-                std::string_view where_text = trim(after_from.substr(local_where_pos + 5));
-                const size_t order_pos = ifind_keyword(where_text, "ORDER BY");
-                if (order_pos != std::string::npos)
-                {
-                    std::string_view actual_where = trim(where_text.substr(0, order_pos));
-                    if (!actual_where.empty() && !parse_where_clause(actual_where, sq))
-                        return false;
-                    std::string_view order_text = trim(where_text.substr(order_pos + 8));
-                    std::stringstream ss((std::string(order_text)));
-                    std::string col;
-                    if (ss >> col)
-                    {
-                        sq.has_order_by = true;
-                        sq.order_by_column = col;
-                        std::string dir;
-                        if (ss >> dir)
-                        {
-                            std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper);
-                            if (dir == "DESC")
-                                sq.order_desc = true;
-                        }
-                    }
-                }
-                else
-                {
-                    if (!parse_where_clause(where_text, sq))
-                        return false;
-                }
-            }
-            else if (local_order_pos != std::string::npos)
-            {
-                std::string_view order_text = trim(after_from.substr(local_order_pos + 8));
-                std::stringstream ss((std::string(order_text)));
-                std::string col;
-                if (ss >> col)
-                {
-                    sq.has_order_by = true;
-                    sq.order_by_column = col;
-                    std::string dir;
-                    if (ss >> dir)
-                    {
-                        std::transform(dir.begin(), dir.end(), dir.begin(), ::toupper);
-                        if (dir == "DESC")
-                            sq.order_desc = true;
-                    }
-                }
-            }
-        }
-
-        if (sq.table_name.empty() || sq.columns.empty())
-            return false;
-        result.type = QueryType::SELECT;
-        result.query = std::move(sq);
-        return true;
-    }
-
-    bool parse_delete(std::string_view q, ParsedQuery &result)
-    {
-        if (!starts_with_keyword(q, "DELETE"))
-            return false;
-        q = trim(q.substr(6));
-        if (!starts_with_keyword(q, "FROM"))
-            return false;
-        q = trim(q.substr(4));
-
-        const size_t where_pos = ifind_keyword(q, "WHERE");
-        std::string_view table_view = (where_pos == std::string::npos) ? q : trim(q.substr(0, where_pos));
-        if (!is_valid_identifier(table_view))
-            return false;
-
-        DeleteQuery dq;
-        dq.table_name = std::string(table_view);
-        if (where_pos != std::string::npos)
-        {
-            SelectQuery dummy;
-            if (parse_where_clause(trim(q.substr(where_pos + 5)), dummy))
-            {
-                dq.has_where = true;
-                dq.where_column = dummy.where_column;
-                dq.where_value = dummy.where_value;
-                dq.where_op = dummy.where_op;
-            }
-            else
-                return false;
-        }
-        result.type = QueryType::DELETE;
-        result.query = std::move(dq);
-        return true;
     }
 }
 
-ParsedQuery Parser::parse(const std::string &sql)
-{
-    ParsedQuery result;
-    result.type = QueryType::UNKNOWN;
-    result.query = CheckpointQuery{};
+bool Parser::icase_eq(std::string_view a, std::string_view b) const {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++)
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+    return true;
+}
 
-    std::string_view q = trim(sql);
-    if (!q.empty() && q.back() == ';')
-    {
-        q.remove_suffix(1);
-        q = trim(q);
-    }
-    if (q.empty())
-        return result;
-    if (q.size() >= 2 && q[0] == '-' && q[1] == '-')
-        return result;
+bool Parser::try_consume(std::string_view tok) {
+    if (has() && icase_eq(peek(), tok)) { pos_++; return true; }
+    return false;
+}
 
-    if (starts_with_keyword(q, "CHECKPOINT"))
-    {
-        result.type = QueryType::CHECKPOINT;
-        result.query = CheckpointQuery{};
-        return result;
+bool Parser::expect(std::string_view tok) {
+    if (!has() || !icase_eq(peek(), tok)) return false;
+    pos_++;
+    return true;
+}
+
+ColType Parser::parse_type(const std::string& tok, uint16_t& max_len) {
+    max_len = 0;
+    std::string up = tok;
+    std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+    if (up == "INT" || up == "INTEGER" || up == "BIGINT") return ColType::INT;
+    if (up == "DECIMAL" || up == "FLOAT" || up == "DOUBLE" || up == "REAL") return ColType::DECIMAL;
+    if (up == "DATETIME" || up == "TIMESTAMP") return ColType::DATETIME;
+    // VARCHAR / TEXT
+    max_len = 255;
+    return ColType::VARCHAR;
+}
+
+bool Parser::parse_create(Statement& s, std::string& err) {
+    if (!expect("TABLE")) { err = "Expected TABLE"; return false; }
+    if (icase_eq(peek(), "IF")) {
+        consume(); // IF
+        if (!expect("NOT")) { err = "Expected NOT after IF"; return false; }
+        if (!expect("EXISTS")) { err = "Expected EXISTS after NOT"; return false; }
+    }
+    if (!has()) { err = "Expected table name"; return false; }
+    s.table_name = std::string(consume());
+    std::transform(s.table_name.begin(), s.table_name.end(), s.table_name.begin(), ::toupper);
+    if (!expect("(")) { err = "Expected ("; return false; }
+
+    while (has() && !icase_eq(peek(), ")")) {
+        ColSpec cs{};
+        cs.name = std::string(consume());
+        std::transform(cs.name.begin(), cs.name.end(), cs.name.begin(), ::toupper);
+        if (!has()) { err = "Expected type"; return false; }
+        std::string type_tok = std::string(consume());
+        cs.type = parse_type(type_tok, cs.max_len);
+        // Optional: VARCHAR(N)
+        if (cs.type == ColType::VARCHAR && has() && peek() == "(") {
+            consume(); // (
+            if (has() && peek() != ")") cs.max_len = (uint16_t)std::stoi(std::string(consume()));
+            expect(")");
+        }
+        // Modifiers: PRIMARY KEY, NOT NULL
+        while (has() && !icase_eq(peek(), ",") && !icase_eq(peek(), ")")) {
+            if (icase_eq(peek(), "PRIMARY")) {
+                consume(); try_consume("KEY"); cs.primary_key = true;
+            } else if (icase_eq(peek(), "NOT")) {
+                consume(); try_consume("NULL"); cs.not_null = true;
+            } else {
+                consume(); // skip AUTOINCREMENT etc
+            }
+        }
+        s.col_specs.push_back(cs);
+        try_consume(",");
+    }
+    expect(")");
+    try_consume(";");
+    return true;
+}
+
+bool Parser::parse_insert(Statement& s, std::string& err) {
+    if (!expect("INTO")) { err = "Expected INTO"; return false; }
+    if (!has()) { err = "Expected table name"; return false; }
+    std::string tbl = std::string(consume());
+    std::transform(tbl.begin(), tbl.end(), tbl.begin(), ::toupper);
+    s.table_name = tbl;
+
+    // Skip optional column list
+    if (has() && icase_eq(peek(), "(")) {
+        // Could be column list or VALUES (...)
+        // Peek: if first token inside looks like an identifier -> column list; skip
+        consume(); // (
+        int depth = 1;
+        while (has() && depth > 0) {
+            if (peek() == "(") depth++;
+            else if (peek() == ")") depth--;
+            if (depth > 0) consume();
+        }
+        consume(); // closing )
     }
 
-    if (starts_with_keyword(q, "CREATE"))
-    {
-        if (parse_create_table(q, result))
-            return result;
-    }
-    else if (starts_with_keyword(q, "INSERT"))
-    {
-        if (parse_insert(q, result))
-            return result;
-    }
-    else if (starts_with_keyword(q, "SELECT"))
-    {
-        if (parse_select(q, result))
-            return result;
-    }
-    else if (starts_with_keyword(q, "DELETE"))
-    {
-        if (parse_delete(q, result))
-            return result;
+    if (!expect("VALUES")) { err = "Expected VALUES"; return false; }
+    
+    do {
+        if (!expect("(")) { err = "Expected ("; return false; }
+        std::vector<std::string_view> row;
+        while (has() && !icase_eq(peek(), ")")) {
+            row.push_back(consume());
+            try_consume(",");
+        }
+        if (!expect(")")) { err = "Expected )"; return false; }
+        s.insert_rows.push_back(std::move(row));
+    } while (try_consume(","));
+
+    try_consume(";");
+    return true;
+}
+
+bool Parser::parse_select(Statement& s, std::string& err) {
+    // Parse column list or *
+    if (has() && peek() == "*") {
+        consume();
+        s.select_cols.push_back({true, "", ""});
+    } else {
+        // col, col, ...
+        while (has() && !icase_eq(peek(), "FROM")) {
+            SelectCol sc{false, "", ""};
+            std::string tok = std::string(consume());
+            // Check for "table.col"
+            auto dot = tok.find('.');
+            if (dot != std::string::npos) {
+                sc.table = tok.substr(0, dot);
+                sc.col   = tok.substr(dot + 1);
+                std::transform(sc.table.begin(), sc.table.end(), sc.table.begin(), ::toupper);
+                std::transform(sc.col.begin(), sc.col.end(), sc.col.begin(), ::toupper);
+                if (sc.col == "*") sc.star = true;
+            } else {
+                std::transform(tok.begin(), tok.end(), tok.begin(), ::toupper);
+                sc.col = tok;
+            }
+            s.select_cols.push_back(sc);
+            try_consume(",");
+        }
     }
 
-    return result;
+    if (!expect("FROM")) { err = "Expected FROM"; return false; }
+    if (!has()) { err = "Expected table name"; return false; }
+    s.from_table = std::string(consume());
+    std::transform(s.from_table.begin(), s.from_table.end(), s.from_table.begin(), ::toupper);
+
+    // INNER JOIN?
+    if (has() && icase_eq(peek(), "INNER")) {
+        consume(); // INNER
+        if (!expect("JOIN")) { err = "Expected JOIN"; return false; }
+        JoinClause jc;
+        jc.right_table = std::string(consume());
+        std::transform(jc.right_table.begin(), jc.right_table.end(), jc.right_table.begin(), ::toupper);
+        if (!expect("ON")) { err = "Expected ON"; return false; }
+        jc.left_col  = std::string(consume());
+        std::transform(jc.left_col.begin(), jc.left_col.end(), jc.left_col.begin(), ::toupper);
+        expect("=");
+        jc.right_col = std::string(consume());
+        std::transform(jc.right_col.begin(), jc.right_col.end(), jc.right_col.begin(), ::toupper);
+        s.join = jc;
+    }
+
+    // WHERE?
+    if (has() && icase_eq(peek(), "WHERE")) {
+        consume();
+        s.where = WhereClause{};
+        if (!parse_where(s.where.value(), err)) return false;
+    }
+
+    if (has() && icase_eq(peek(), "ORDER")) {
+        consume(); // ORDER
+        if (!expect("BY")) { err = "Expected BY after ORDER"; return false; }
+        if (!has()) { err = "Expected column for ORDER BY"; return false; }
+        s.order_by_col = std::string(consume());
+        std::transform(s.order_by_col.begin(), s.order_by_col.end(), s.order_by_col.begin(), ::toupper);
+        if (has() && icase_eq(peek(), "DESC")) {
+            consume();
+            s.order_desc = true;
+        } else if (has() && icase_eq(peek(), "ASC")) {
+            consume();
+        }
+    }
+
+    try_consume(";");
+    return true;
+}
+
+bool Parser::parse_delete(Statement& s, std::string& err) {
+    s.type = StmtType::DELETE;
+    // The "DELETE" token has already been consumed by parse()
+    if (!expect("FROM")) { err = "Expected FROM"; return false; }
+    if (!has()) { err = "Expected table name"; return false; }
+    s.table_name = std::string(consume());
+    std::transform(s.table_name.begin(), s.table_name.end(), s.table_name.begin(), ::toupper);
+    if (has() && icase_eq(peek(), "WHERE")) {
+        consume();
+        s.where = WhereClause{};
+        if (!parse_where(s.where.value(), err)) return false;
+    }
+    try_consume(";");
+    return true;
+}
+
+bool Parser::parse_where(WhereClause& w, std::string& err) {
+    if (!has()) { err = "Expected WHERE column"; return false; }
+    w.col = std::string(consume());
+    std::transform(w.col.begin(), w.col.end(), w.col.begin(), ::toupper);
+    if (!has()) { err = "Expected operator"; return false; }
+    w.op = std::string(consume());
+    if (!has()) { err = "Expected value"; return false; }
+    w.rhs = std::string(consume());
+    return true;
+}
+
+bool Parser::parse(const std::string& sql, Statement& stmt, std::string& err) {
+    tokenize(sql);
+    if (!has()) { err = "Empty statement"; return false; }
+    std::string first = std::string(consume());
+
+    bool ok = false;
+    if (icase_eq(first, "CREATE")) {
+        stmt.type = StmtType::CREATE_TABLE;
+        ok = parse_create(stmt, err);
+    } else if (icase_eq(first, "INSERT")) {
+        stmt.type = StmtType::INSERT;
+        ok = parse_insert(stmt, err);
+    } else if (icase_eq(first, "SELECT")) {
+        stmt.type = StmtType::SELECT;
+        ok = parse_select(stmt, err);
+    } else if (icase_eq(first, "DELETE")) {
+        stmt.type = StmtType::DELETE;
+        ok = parse_delete(stmt, err);
+    } else {
+        err = "Unknown statement: " + first;
+        return false;
+    }
+
+    if (ok && has()) {
+        err = "Syntax error: trailing characters: " + std::string(peek());
+        return false;
+    }
+    if (pos_ < tokens_.size()) {
+        err = "Syntax error: trailing characters: " + std::string(peek());
+        return false;
+    }
+    return ok;
 }
