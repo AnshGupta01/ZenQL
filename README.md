@@ -5,141 +5,76 @@
 <h1 align="center">ZenQL</h1>
 
 <p align="center">
-  <strong>Built for</strong><br/>
-  <strong>CS69202: Design Lab 2026</strong><br/>
-  IIT Kharagpur
+  <strong>CS69202: Design Lab 2026</strong> • IIT Kharagpur
 </p>
 
 <p align="center">
-  A modern, high-performance SQL-like client/server engine with a compact wire protocol and checkpoint-backed persistence.
+  A high-performance SQL engine with a compact wire protocol, columnar in-memory storage, and checkpoint-backed persistence.
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/C%2B%2B-17-00599C?logo=c%2B%2B&logoColor=white" alt="C++17" />
   <img src="https://img.shields.io/badge/Build-Make-427819?logo=gnu&logoColor=white" alt="Make" />
   <img src="https://img.shields.io/badge/Protocol-TCP-0A66C2" alt="TCP" />
-  <img src="https://img.shields.io/badge/API-FlexQL-111827" alt="FlexQL API" />
   <img src="https://img.shields.io/badge/Persistence-Checkpoint-9A3412" alt="Checkpoint" />
 </p>
 
-The public client API and binaries are named `flexql_*`, so this repo uses both names:
+---
 
-- Project name: ZenQL
-- C API / binaries: FlexQL
+## ⚡ Quick Start
 
-## What Works
-
-- Multithreaded TCP server on port `9000`.
-- C API in `include/flexql.h`:
-  - `flexql_open`
-  - `flexql_exec`
-  - `flexql_close`
-  - `flexql_free`
-- SQL subset:
-  - `CREATE TABLE [IF NOT EXISTS] ...`
-  - `INSERT INTO ... VALUES (...)` (multi-row batches supported)
-  - `SELECT ... FROM ...`
-  - `WHERE` with `=`, `>`, `<`, `>=`, `<=`
-  - `ORDER BY <col> [DESC]`
-  - `INNER JOIN ... ON ...`
-  - `DELETE FROM <table> [WHERE ...]`
-- Optional row TTL using `INSERT ... EXPIRY <seconds>`.
-- Checkpoint-based persistence in `data/` on startup/shutdown.
-
-## Build
-
+### Build
 ```bash
 make clean && make
 ```
 
-Build output:
-
-- `bin/flexql_server`
-- `bin/flexql_repl`
-- `bin/benchmark_flexql`
-- `bin/libflexql.a`
-
-## Run
-
-Start server:
-
-```bash
-make run-server
-```
-
-In another terminal, start REPL:
-
-```bash
-make run-repl
-```
-
-## Quick SQL Example
-
-```sql
-CREATE TABLE USERS(ID INT PRIMARY KEY, NAME VARCHAR, BALANCE DECIMAL);
-INSERT INTO USERS VALUES (1, 'Alice', 1200), (2, 'Bob', 450);
-SELECT NAME, BALANCE FROM USERS WHERE BALANCE > 500 ORDER BY BALANCE DESC;
-DELETE FROM USERS WHERE ID = 2;
-```
-
-## Benchmarks And Data-Level Tests
-
-One benchmark binary is currently maintained: `bin/benchmark_flexql`.
-
-Run insertion benchmark (server is auto-started by the target):
-
-```bash
-make run-benchmark ARGS="1000000"
-```
-
-Run built-in data-level unit tests:
-
-```bash
-bin/benchmark_flexql --unit-test
-```
-
-Notes:
-
-- `make run-benchmark` kills any existing `flexql_server`, starts a fresh one, and then runs the benchmark.
-- There is no `benchmarks/run_all.sh` script in this repository.
-
-## Protocol Notes
-
-- Client sends one SQL statement per line (`\n` terminated).
-- Server responds with text rows and terminates each response with a sentinel `\x00END\x00`.
-
-## Current Constraints
-
-- SQL dialect is intentionally limited and non-standard in places.
-- No `UPDATE`, no transactions, no multi-statement parsing in a single request.
-- `CHECKPOINT` is parsed but not currently wired as an executable command path.
-
-## Repository Layout
-
-- `src/server`: TCP server and connection handling.
-- `src/client`: C API implementation and REPL.
-- `src/parser`: SQL subset parser.
-- `src/query`: query execution engine.
-- `src/storage`: table storage and checkpoint manager.
-- `src/index`: hash and btree index implementations.
-- `benchmarks`: benchmark source.
-
-## Benchmark Results Log
-
-Command:
-
-```bash
-make run-benchmark ARGS="10000000"
-```
-
-Observed output summary:
-
-| Date       |       Rows | Elapsed (ms) | Throughput (rows/sec) | Unit Tests   |
-| :--------- | ---------: | -----------: | --------------------: | :----------- |
-| 2026-03-27 | 10,000,000 |       21,637 |               462,171 | 22/22 passed |
-
-Benchmark output is hardware and system-load dependent.
+### Run
+1. **Server**: `make run-server`
+2. **REPL**: `make run-repl`
+3. **Benchmark**: `make run-benchmark ARGS="10000000"`
 
 ---
 
-Author: Ansh Gupta, IIT Kharagpur
+## Architecture & Design
+
+ZenQL is optimized for high-throughput, in-memory analytical workloads:
+
+- **Columnar Storage**: Data is stored in decomposed vectors (`StringColumn`) rather than row-based structs, significantly improving cache locality for filtered scans and joins.
+- **Multi-Layered Caching**: 
+  - **Thread-Local TableCache**: Minimizes lock contention for frequent point-lookups.
+  - **Versioned JoinCache**: Uses a "build-once, probe-many" strategy for hash joins, invalidated only on table mutations.
+- **ThreadPool Concurrency**: A fixed-size thread pool manages both connection handling and parallelized query execution (e.g., parallelized join probing).
+- **Efficient SQL Parsing**: The parser identifies statement types and literals directly from the incoming buffer with minimal allocations.
+
+---
+
+## Features
+
+- **SQL Subset**: `CREATE`, `INSERT` (batched), `SELECT`, `WHERE`, `ORDER BY`, `INNER JOIN`, and `DELETE`.
+- **High Performance**: ~460k+ inserts/sec via columnar storage and zero-copy parsing paths.
+- **Persistence**: Snapshot-based recovery via `CheckpointManager`.
+- **TTL Support**: Built-in row expiration (e.g., `INSERT ... EXPIRY <seconds>`).
+- **Concurrency**: Multi-threaded TCP server with thread-pooled query execution.
+
+---
+
+## Benchmark results (10M Rows)
+
+| Date | Rows | Elapsed | Throughput | Unit Tests |
+| :--- | :--- | :--- | :--- | :--- |
+| 2026-03-31 | 10,000,000 | 21,651 ms | **461,872 rows/sec** | 22/22 (100%) |
+
+---
+
+## Repository Structure
+
+- `src/server`: Connection handling & ThreadPool.
+- `src/parser`: Zero-copy SQL parser.
+- `src/query`: `OptimizedDatabase` execution engine.
+- `src/storage`: `Table` (columnar) & `CheckpointManager`.
+- `src/index`: Fast Hash & B-Tree indexing.
+- `src/client`: C API (`libflexql`) and REPL frontend.
+
+---
+
+**Author**: Ansh Gupta, IIT Kharagpur

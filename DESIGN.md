@@ -1,5 +1,7 @@
 # ZenQL Design Document
 
+**GitHub Repository**: [https://github.com/AnshGupta01/ZenQL](https://github.com/AnshGupta01/ZenQL)
+
 This document describes the current architecture and behavior of ZenQL as implemented in this repository.
 
 ## 1. System Overview
@@ -47,19 +49,35 @@ Notes:
 - Semicolon is optional at parse stage; trailing `;` is stripped.
 - `CHECKPOINT` is recognized by the parser but is not currently executed as a dedicated branch in `OptimizedDatabase`.
 
-## 4. Storage And Indexing
+## 4. Storage Architecture
 
-Table storage and typed schema are in `src/storage`.
+ZenQL uses a **Columnar Storage Model** (Decomposed Storage) for high-performance in-memory operations.
 
-Current indexing behavior:
+- **Columnar Vectors**: Each table consists of a collection of `StringColumn` instances, where each column's data is stored in a contiguous `std::vector<std::string>`. This layout improves cache locality during scans and filters.
+- **Expiry Metadata**: Row expiration timestamps are stored in a separate parallel vector, allowing for rapid liveness checks without accessing row data.
+- **Memory Management**: Rows are imported into the underlying vectors using `std::move` where possible to minimize string copies.
 
-- `FastHashIndex` is maintained per table for point lookup acceleration.
-- Primary key column index is derived from schema (`PRIMARY KEY`) when provided.
-- If no primary key is declared, index position defaults to column `0`.
+## 5. Indexing Method
 
-`BTreeIndex` scaffolding exists in `src/index/btree_index.h`, but primary query execution is currently centered on hash index plus scan/filter/order operations.
+ZenQL maintains primary key lookups via a **Fast Hash Index**.
 
-## 5. Query Execution Path
+- `FastHashIndex`: Provides $O(1)$ point lookup acceleration for primary key columns.
+- **Index Derivation**: The primary key column index is derived from the schema (`PRIMARY KEY`). If no primary key is declared, the index defaults to column `0`.
+- **B-Tree Scaffolding**: `BTreeIndex` scaffolding exists in `src/index/btree_index.h` for future range query optimizations.
+
+## 6. Caching Strategy
+
+The system employs two primary caching layers to minimize lock contention and redundant computation:
+
+1. **Thread-Local Table Cache (`TableCache`)**:
+   - Each thread maintains a local cache of the most recently accessed table's pointer, primary index, and precomputed result headers.
+   - This avoids global map lookups and shared mutex acquisitions for repeated operations on the same table.
+2. **Versioned Join Hash Cache (`JoinHashCache`)**:
+   - For `INNER JOIN` operations, the probe-side hash table is cached globally.
+   - Each cache entry is tied to a **Table Version Number**. If a table is modified (INSERT/DELETE), its version increments, and any existing join caches for that table are invalidated.
+   - This ensures joining a 10M row table repeatedly stays performant after the initial build.
+
+## 7. Query Execution Path
 
 `OptimizedDatabase::execute_to_buffer` in `src/query/optimized_database.h` handles execution.
 
@@ -77,7 +95,7 @@ Execution highlights:
 
 All results are serialized to a string buffer as tab-delimited rows with a status/header prefix.
 
-## 6. TTL And Expiration
+## 8. TTL And Expiration
 
 Rows have separate expiration metadata in table storage.
 
@@ -87,7 +105,7 @@ Behavior:
 - Expired rows are skipped by select/join lookups.
 - Expired rows are not immediately compacted unless modified through operations such as delete/rewrite.
 
-## 7. Persistence And Recovery
+## 9. Persistence And Recovery
 
 Persistence is enabled in server startup via:
 
@@ -100,7 +118,7 @@ Checkpoint lifecycle:
 
 This provides crash-restart durability at checkpoint granularity.
 
-## 8. Network Protocol
+## 10. Network Protocol
 
 Protocol is plaintext and line-based:
 
@@ -110,7 +128,7 @@ Protocol is plaintext and line-based:
 
 The protocol is intentionally simple and optimized for low overhead in the provided client library.
 
-## 9. Current Limitations
+## 11. Current Limitations
 
 - No transaction semantics (`BEGIN/COMMIT/ROLLBACK` not implemented).
 - No `UPDATE` command.
@@ -118,10 +136,51 @@ The protocol is intentionally simple and optimized for low overhead in the provi
 - Error reporting is concise and not yet highly diagnostic.
 - Secondary index usage is limited in current execution paths.
 
-## 10. Design Intent
+## 12. Design Intent
 
 ZenQL prioritizes:
 
 - Fast local development cycle (single Makefile, no external runtime dependencies).
 - High-throughput in-memory operations with practical persistence checkpoints.
 - A compact SQL subset suitable for benchmarking parser, index, and concurrency strategies.
+
+## 13. Compilation and Execution
+
+ZenQL is built with standard C++17 tools and has no external dependencies.
+
+### Build
+```bash
+make clean && make
+```
+
+### Run Server
+```bash
+make run-server
+```
+
+### Run REPL (Client)
+```bash
+make run-repl
+```
+
+### Run Benchmarks
+```bash
+# General insertion benchmark
+make run-benchmark ARGS="10000000"
+
+# Direct binary execution
+./bin/benchmark_flexql 10000000
+
+# Run internal unit tests
+./bin/benchmark_flexql --unit-test
+```
+
+## 14. Performance Results
+
+The following results were observed on 10 million rows:
+
+- **Environment**: Macbook Air M1 8GB RAM
+- **Dataset**: 10,000,000 rows
+- **Elapsed Time**: 21,651 ms
+- **Throughput**: ~461,872 rows/sec
+- **Unit Test Correctness**: 22/22 passed (100% pass rate)
